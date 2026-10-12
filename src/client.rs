@@ -426,7 +426,13 @@ impl VpnTunnel {
     }
     /// Releases packet endpoints and the stream before returning. Existing failures propagate.
     pub async fn stop(mut self) -> Result<()> {
-        let task = self.task.take().unwrap();
+        self.stop_mut().await
+    }
+
+    pub(crate) async fn stop_mut(&mut self) -> Result<()> {
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
         if !task.is_finished() {
             task.abort();
         }
@@ -435,6 +441,7 @@ impl VpnTunnel {
             Err(e) if e.is_cancelled() => Ok(()),
             Err(e) => Err(Error::Protocol(e.into())),
         };
+        self.task.take();
         if result.is_ok() {
             self.publish.send_replace(SessionState::Closed);
         }

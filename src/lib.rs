@@ -28,6 +28,8 @@ pub mod packet;
 mod request;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "client")]
+pub mod session;
 pub mod stats;
 pub mod vpn;
 #[cfg(any(feature = "server", test))]

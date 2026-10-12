@@ -420,3 +420,59 @@ async fn rustls_slow_readers_preserve_bidirectional_backpressure() {
 async fn embedded_vpn_uses_packet_io_and_releases_owned_endpoints() {
     vpn_acceptance().await;
 }
+
+#[tokio::test]
+async fn session_retains_packet_device_across_loss_failed_recovery_and_new_carrier() {
+    use foldfin::session::{Event, Session};
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (packet_device, tx, _rx) = device(drops.clone());
+    let mut session = Session::new(config("198.18.0.1", "198.18.0.2"), packet_device).unwrap();
+    let mut events = session.subscribe();
+    for _ in 0..2 {
+        let (packet_device, _tx, mut received) = device(Arc::new(AtomicUsize::new(0)));
+        let fixture = Fixture::new(Some(VpnConfig {
+            policy: config("198.18.0.2", "198.18.0.1"),
+            device: Arc::new(Factory(Mutex::new(Some(packet_device)))),
+        }))
+        .await;
+        let client = fixture.client().await;
+        session.recover(client.clone()).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !matches!(*events.borrow_and_update(), Event::Running) {
+                events.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let packet = packet([198, 18, 0, 1], [198, 18, 0, 2]);
+        tx.send(packet.clone()).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(3), received.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            packet
+        );
+        client.stop().await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !matches!(*events.borrow_and_update(), Event::CarrierLost { .. }) {
+                events.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        fixture.stop().await;
+        // A server without VPN capability rejects negotiation; the device remains owned.
+        let rejected = Fixture::new(None).await;
+        assert!(session.recover(rejected.client().await).await.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(matches!(session.snapshot(), Event::CarrierLost { .. }));
+        rejected.stop().await;
+    }
+    assert_eq!(session.stats().tx_bytes, 56);
+    session.stop().await.unwrap();
+    session.stop().await.unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    assert_eq!(session.snapshot(), Event::Closed);
+}

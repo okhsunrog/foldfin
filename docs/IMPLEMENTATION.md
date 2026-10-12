@@ -49,3 +49,10 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   switches removed. Floppa's importing adapter updated to the rustls-only client
   API. Existing measurements remain historical. H2 proxy and Floppa's three
   integration tests pass after the removal.
+- H2 `session::Session` retains the packet device across carrier failure,
+  failed negotiation and explicit recovery. Recovery is host-driven and one
+  attempt at a time; stop joins tasks before releasing the device. Integration
+  tests verify packet transfer over two carriers and no premature device drop.
+- Floppa network-change handling now replaces the carrier through that session;
+  a manager-level test verifies device ownership remains stable and forwarding
+  resumes. Actor-wide retry states and session-scoped Android Underlay remain open.

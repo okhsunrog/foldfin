@@ -23,7 +23,11 @@ pub mod error;
 mod h2_io;
 #[cfg(any(feature = "client", feature = "server"))]
 mod h2_window;
+#[cfg(feature = "h3")]
+pub mod h3_transport;
 pub mod packet;
+#[cfg(feature = "server")]
+mod request;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod stats;

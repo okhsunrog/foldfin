@@ -18,6 +18,8 @@ pub enum Error {
     Timeout(&'static str),
     #[error("carrier closed")]
     Closed,
+    #[error("path payload capacity {available} is below required MTU {required}")]
+    PathMtu { required: usize, available: usize },
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
 }

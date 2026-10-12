@@ -31,3 +31,17 @@ remote test node, reached via physical namespace/veth/NAT with route/source/capt
 evidence. Tests do not change host default routes, DNS or global TCP settings.
 Node authorization leases default to one hour, bounded by subscription expiry.
 Unavailable device/WAN acceptance must remain explicitly incomplete.
+
+## Validated increments
+
+- Collector cancellation fairness and ADDRESS_REQUEST/ADDRESS_ASSIGN bounds fixed.
+- Optional `h3` carrier implements prepared UDP socket ownership, TLS 1.3/SNI,
+  extended CONNECT, reliable streams, HTTP datagrams, path payload checks and
+  joined shutdown. Local tests cover four independent streams, half-close,
+  nonzero quarter-stream IDs and negative certificate/name validation.
+  This is a carrier API, not yet the integrated CONNECT-IP VPN bridge.
+- CONNECT syntax is validated before application authorization, with an H2
+  regression proving invalid requests never call the authorizer.
+- Published h3 0.0.8 lacks CONNECT-IP and h3-datagram 0.0.2 discards the encoded
+  stream ID. Minimal vendored patches are documented in vendor/README.md.
+  They must also be applied at embedding workspace roots.

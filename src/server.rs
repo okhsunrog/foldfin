@@ -1,8 +1,6 @@
 //! Embeddable single-static-peer server. The application owns TLS material,
 //! listeners, device setup and shutdown. No runtime, environment or signals are owned here.
-use crate::authorization::{
-    AccessGrant, AccessLease, AccessRequest, Authorizer, RequestedMode, StaticAuthorizer,
-};
+use crate::authorization::{AccessGrant, AccessLease, AccessRequest, Authorizer, StaticAuthorizer};
 use crate::{
     credential::Credential,
     packet::PacketDeviceFactory,
@@ -215,22 +213,23 @@ async fn serve_authorized(
     authorizer: Arc<dyn Authorizer>,
     counters: Arc<crate::stats::Counters>,
 ) -> Result<()> {
-    let mode = if req.extensions().get::<h2::ext::Protocol>().is_some() {
-        RequestedMode::Ip
-    } else {
-        RequestedMode::Tcp {
-            target: req
-                .uri()
-                .authority()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
-        }
-    };
+    let protocol = req
+        .extensions()
+        .get::<h2::ext::Protocol>()
+        .map(|p| p.as_str());
+    let mode = crate::request::validate(&req, protocol);
+    if req.method() == http::Method::CONNECT && mode.is_none() {
+        reply.send_response(Response::builder().status(400).body(())?, true)?;
+        return Ok(());
+    }
     let grant = if req.method() == http::Method::CONNECT {
         if let Some(header) = req.headers().get("authorization") {
             timeout(
                 crate::DEADLINE,
-                authorizer.authorize(AccessRequest::new(mode, header.clone())),
+                authorizer.authorize(AccessRequest::new(
+                    mode.expect("CONNECT validated above"),
+                    header.clone(),
+                )),
             )
             .await??
         } else {
@@ -274,22 +273,7 @@ async fn serve_granted(
     counters: Arc<crate::stats::Counters>,
     vpn_slot: Arc<Semaphore>,
 ) -> Result<()> {
-    if let Some(protocol) = req.extensions().get::<h2::ext::Protocol>() {
-        if protocol.as_str() != "connect-ip"
-            || req.uri().path() != crate::vpn::PATH
-            || req.uri().scheme_str() != Some("https")
-            || req
-                .headers()
-                .get("capsule-protocol")
-                .and_then(|h| h.to_str().ok())
-                != Some("?1")
-            || ["content-length", "content-type", "transfer-encoding"]
-                .iter()
-                .any(|h| req.headers().contains_key(*h))
-        {
-            reply.send_response(Response::builder().status(400).body(())?, true)?;
-            return Ok(());
-        }
+    if req.extensions().get::<h2::ext::Protocol>().is_some() {
         let Some(config) = vpn else {
             reply.send_response(Response::builder().status(501).body(())?, true)?;
             return Ok(());
@@ -332,4 +316,66 @@ async fn serve_granted(
     };
     let output = reply.send_response(Response::builder().status(200).body(())?, false)?;
     crate::bridge(tcp, req.into_body(), output).await
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    struct Count(AtomicUsize);
+    impl Authorizer for Count {
+        fn authorize(
+            &self,
+            _: AccessRequest,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<Option<AccessGrant>>> + Send + '_>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(None) })
+        }
+    }
+    #[tokio::test]
+    async fn malformed_connect_never_calls_authorizer() {
+        let authorizer = Arc::new(Count(AtomicUsize::new(0)));
+        let (client, server) = tokio::io::duplex(65536);
+        let access = authorizer.clone();
+        let server = tokio::spawn(async move {
+            let mut builder = h2::server::Builder::new();
+            builder.enable_connect_protocol();
+            let mut conn = builder.handshake(server).await.unwrap();
+            let (request, response) = conn.accept().await.unwrap().unwrap();
+            let serve = serve_authorized(request, response, access, Arc::new(Counters::default()));
+            tokio::pin!(serve);
+            tokio::select! {
+                result = &mut serve => result.unwrap(),
+                _ = conn.accept() => panic!("unexpected connection termination"),
+            }
+            // Flush the response until the client closes.
+            let _ = conn.accept().await;
+        });
+        let (sender, connection) = h2::client::handshake(client).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let mut sender = sender.ready().await.unwrap();
+        while !sender.is_extended_connect_protocol_enabled() {
+            tokio::task::yield_now().await;
+        }
+        let request = Request::builder()
+            .method("CONNECT")
+            .uri("https://localhost/wrong")
+            .extension(h2::ext::Protocol::from_static("connect-ip"))
+            .header("authorization", "Bearer 0123456789abcdef0123456789abcdef")
+            .header("capsule-protocol", "?1")
+            .body(())
+            .unwrap();
+        let (response, _) = sender.send_request(request, true).unwrap();
+        assert_eq!(response.await.unwrap().status(), 400);
+        assert_eq!(authorizer.0.load(Ordering::SeqCst), 0);
+        drop(sender);
+        driver.abort();
+        let _ = driver.await;
+        server.await.unwrap();
+    }
 }

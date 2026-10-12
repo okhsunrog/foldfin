@@ -43,6 +43,10 @@ impl Client {
             packets: Mutex::new(packets),
         })))
     }
+    pub async fn closed(&self) {
+        let connection = self.0.transport.lock().await.datagrams();
+        connection.closed().await;
+    }
     pub async fn stop(&self) -> Result<()> {
         self.0.transport.lock().await.stop_mut().await;
         self.0.packets.lock().await.stop().await;
@@ -62,6 +66,32 @@ impl Client {
         })
         .await
         .map_err(|_| Error::Timeout("H3 carrier probe"))?
+    }
+    pub async fn open_tcp(&self, target: &str) -> Result<crate::h3_tcp::TcpFlow> {
+        let authority: http::uri::Authority = target
+            .parse()
+            .map_err(|_| Error::InvalidConfig("invalid TCP target".into()))?;
+        if authority.port_u16().is_none_or(|p| p == 0) {
+            return Err(Error::InvalidConfig(
+                "TCP target needs a nonzero port".into(),
+            ));
+        }
+        timeout(crate::DEADLINE, async {
+            let request = http::Request::builder()
+                .method("CONNECT")
+                .uri(target)
+                .header("authorization", self.0.config.credential.header())
+                .body(())
+                .map_err(|e| Error::InvalidConfig(e.to_string()))?;
+            let mut stream = self.0.transport.lock().await.request(request, None).await?;
+            let response = stream.response().await?;
+            if response.status() != 200 {
+                return Err(Error::Rejected(response.status().as_u16()));
+            }
+            Ok(crate::h3_tcp::TcpFlow::new(stream, self.clone()))
+        })
+        .await
+        .map_err(|_| Error::Timeout("H3 CONNECT"))?
     }
     pub async fn prepare_vpn(&self, config: vpn::Config) -> Result<PreparedVpn> {
         config.validate()?;

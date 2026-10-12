@@ -265,6 +265,10 @@ impl Drop for Client {
 #[derive(Clone)]
 pub struct Datagrams(quinn::Connection);
 impl Datagrams {
+    pub async fn closed(&self) {
+        self.0.closed().await;
+    }
+
     pub fn max_payload(&self, stream: u64) -> Result<usize> {
         let quarter = stream / 4;
         let width = match quarter {
@@ -439,6 +443,14 @@ impl Stream {
     }
 }
 impl SendStream {
+    #[cfg(feature = "client")]
+    pub(crate) fn abort(&mut self) {
+        match &mut self.0 {
+            SendInner::Client(s) => s.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED),
+            SendInner::Server(s) => s.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED),
+        }
+    }
+
     pub async fn send(&mut self, data: Bytes) -> Result<()> {
         match &mut self.0 {
             SendInner::Client(s) => s.send_data(data).await.map_err(protocol),
@@ -453,6 +465,35 @@ impl SendStream {
     }
 }
 impl RecvStream {
+    #[cfg(feature = "client")]
+    pub(crate) fn abort(&mut self) {
+        match &mut self.0 {
+            RecvInner::Client(s) => s.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED),
+            RecvInner::Server(s) => s.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED),
+        }
+    }
+    #[cfg(feature = "client")]
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<Bytes>>> {
+        if let Some(data) = self.1.take() {
+            return std::task::Poll::Ready(Ok(Some(data)));
+        }
+        match &mut self.0 {
+            RecvInner::Client(s) => s.poll_recv_data(cx).map(|result| {
+                result
+                    .map(|data| data.map(|mut b| b.copy_to_bytes(b.remaining())))
+                    .map_err(protocol)
+            }),
+            RecvInner::Server(s) => s.poll_recv_data(cx).map(|result| {
+                result
+                    .map(|data| data.map(|mut b| b.copy_to_bytes(b.remaining())))
+                    .map_err(protocol)
+            }),
+        }
+    }
+
     pub async fn recv(&mut self) -> Result<Option<Bytes>> {
         if let Some(data) = self.1.take() {
             return Ok(Some(data));

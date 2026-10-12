@@ -89,6 +89,7 @@ def main():
     parser.add_argument('--binary', type=pathlib.Path, help='Use one already-built foldfin CLI for both roles')
     parser.add_argument('--output', type=pathlib.Path, help='Retain logs and packet metadata, without TLS keys')
     parser.add_argument('--routed', action='store_true', help='Add a third node behind the server')
+    parser.add_argument('--h3', action='store_true', help='Use HTTP/3 datagrams and an inner MTU of 1280')
     parser.add_argument('--worker', choices=['echo', 'probe'])
     parser.add_argument('--address')
     parser.add_argument('--expect-source')
@@ -102,6 +103,7 @@ def main():
         args.output.chmod(0o700)
     subprocess.run(['sudo', '-n', 'true'], check=True)
     build = ['cargo', 'build', '--bins']
+    if args.h3: build += ['--features', 'h3']
     if not args.no_build and not args.binary:
         subprocess.run(build, cwd=ROOT, check=True)
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=ROOT))
@@ -119,6 +121,8 @@ def main():
     def run(ns, *cmd):
         return subprocess.run(ns_cmd(ns, *cmd), check=True, env=env, timeout=45)
     def launch(ns, log, *cmd, environment=None):
+        if args.h3 and cmd[0] in [binaries/'server', binaries/'client']:
+            cmd = (*cmd, *(['--h3'] if cmd[0] == binaries/'server' else ['--transport', 'h3']))
         if args.binary and cmd[0] in [binaries/'server', binaries/'client']:
             cmd = (args.binary, pathlib.Path(cmd[0]).name, *cmd[1:])
         process = subprocess.Popen(ns_cmd(ns, *cmd), env=environment or env, stdout=log, stderr=log)
@@ -140,6 +144,16 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix='foldfin-vpn-') as tmp:
             tmp = pathlib.Path(tmp)
+            # Keep every launch on this build, even if another cargo invocation
+            # replaces target/debug binaries while the namespace test is running.
+            snapshot_bins = tmp/'bin'; snapshot_bins.mkdir()
+            if args.binary:
+                shutil.copy2(args.binary, snapshot_bins/'foldfin')
+                args.binary = snapshot_bins/'foldfin'
+            else:
+                for name in ['client', 'server', 'foldfin']:
+                    shutil.copy2(binaries/name, snapshot_bins/name)
+                binaries = snapshot_bins
             cert, key = tmp/'cert.pem', tmp/'key.pem'
             subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
                 '-keyout', str(key), '-out', str(cert), '-subj', '/CN=localhost',
@@ -162,7 +176,7 @@ def main():
                 privileged('ip', 'netns', 'exec', ns, 'ip', 'tuntap', 'add', 'dev', 'ffvpn0', 'mode', 'tun', 'user', str(os.getuid()))
                 privileged('ip', '-n', ns, 'addr', 'add', inner4, 'dev', 'ffvpn0')
                 privileged('ip', '-n', ns, '-6', 'addr', 'add', inner6, 'dev', 'ffvpn0', 'nodad')
-                privileged('ip', '-n', ns, 'link', 'set', 'ffvpn0', 'mtu', '1500', 'up')
+                privileged('ip', '-n', ns, 'link', 'set', 'ffvpn0', 'mtu', '1280' if args.h3 else '1500', 'up')
                 privileged('ip', '-n', ns, 'route', 'add', '198.18.0.0/24', 'dev', 'ffvpn0')
                 privileged('ip', '-n', ns, '-6', 'route', 'add', 'fd42:6d69:6d69::/64', 'dev', 'ffvpn0')
             routed4, routed6 = '198.19.0.2', 'fd42:6d69:6c61::2'
@@ -225,7 +239,7 @@ def main():
                     for address in addresses:
                         run(ns, 'ping', '-n', '-c', '2', '-W', '3', address)
                         # Exercise the IPv6 minimum MTU (1280-byte inner packet).
-                        run(ns, 'ping', '-n', '-c', '1', '-W', '3', '-s', '1232' if ':' in address else '1472', address)
+                        run(ns, 'ping', '-n', '-c', '1', '-W', '3', '-s', '1232' if ':' in address else ('1252' if args.h3 else '1472'), address)
                         run(ns, sys.executable, SCRIPT, '--worker', 'probe', '--address', address)
                 if args.routed:
                     for address in [routed4, routed6]:
@@ -243,7 +257,15 @@ def main():
                     for address, size in [(routed4, '1472'), (routed6, '1452')]:
                         result = subprocess.run(ns_cmd(client_ns, 'ping', '-n', '-c', '1', '-W', '3', '-M', 'do', '-s', size, address),
                                                 env=env, capture_output=True, text=True, timeout=10)
-                        assert result.returncode != 0 and '1280' in result.stdout + result.stderr, result.stdout + result.stderr
+                        detail = result.stdout + result.stderr
+                        if args.h3:
+                            # The local TUN already has MTU 1280: EMSGSIZE is
+                            # reported before the packet enters the tunnel.
+                            link = json.loads(subprocess.check_output(['sudo', '-n', 'ip', '-n', client_ns, '-j', 'link', 'show', 'ffvpn0']))[0]
+                            assert link['mtu'] == 1280
+                            assert result.returncode != 0 and ('Message too long' in detail or '1280' in detail), detail
+                        else:
+                            assert result.returncode != 0 and '1280' in detail, detail
                         run(client_ns, sys.executable, SCRIPT, '--worker', 'probe', '--address', address)
                     privileged('ip', '-n', server_ns, 'link', 'set', 'mls0', 'mtu', '1500')
                     privileged('ip', '-n', lan_ns, 'link', 'set', 'ml0', 'mtu', '1500')

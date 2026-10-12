@@ -358,6 +358,15 @@ impl Pseudo {
             ..
         } = uri::Parts::from(uri);
 
+        // RFC 9114 section 4.4: classic CONNECT omits :scheme and :path.
+        // Extended CONNECT retains them (RFC 9220).
+        if method == Method::CONNECT && ext.get::<Protocol>().is_none() {
+            let len = 1 + authority.is_some() as usize;
+            return Self {
+                method: Some(method), authority, len, ..Self::default()
+            };
+        }
+
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
         //= type=implication
         //# This pseudo-header field MUST NOT be empty for "http" or "https"

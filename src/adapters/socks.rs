@@ -1,5 +1,5 @@
 //! Loopback SOCKS5 TCP adapter over the public Client API.
-use crate::{client::Client, stats::SessionState};
+use crate::session::Carrier;
 use anyhow::{Result, bail};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -16,7 +16,7 @@ use tokio::{
 /// Runs until shutdown/carrier failure, cancelling and joining all accepted flows.
 pub async fn serve(
     listener: TcpListener,
-    client: Client,
+    client: impl Into<Carrier>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     if !listener.local_addr()?.ip().is_loopback() {
@@ -24,16 +24,16 @@ pub async fn serve(
     }
     let limit = Arc::new(Semaphore::new(64));
     let mut tasks = JoinSet::new();
-    let mut state = client.subscribe();
+    let client = client.into();
+    let closing = client.clone();
+    let closed = closing.closed();
+    tokio::pin!(closed);
     tokio::pin!(shutdown);
     tracing::info!("SOCKS5 listening on {}", listener.local_addr()?);
     let result = loop {
-        if !matches!(*state.borrow(), SessionState::Running) {
-            break Err(anyhow::anyhow!("carrier closed"));
-        }
         tokio::select! {
             _ = &mut shutdown => break Ok(()),
-            _ = state.changed() => continue,
+            _ = &mut closed => break Err(anyhow::anyhow!("carrier closed")),
             _ = tasks.join_next(), if !tasks.is_empty() => {},
             accepted = listener.accept() => {
                 let (tcp, _) = match accepted { Ok(tcp) => tcp, Err(e) => break Err(e.into()) };
@@ -51,7 +51,7 @@ pub async fn serve(
     result
 }
 
-async fn serve_flow(mut tcp: TcpStream, client: Client) -> Result<()> {
+async fn serve_flow(mut tcp: TcpStream, client: Carrier) -> Result<()> {
     let target = timeout(crate::DEADLINE, negotiate(&mut tcp)).await??;
     match client.open_tcp(&target).await {
         Ok(mut stream) => {

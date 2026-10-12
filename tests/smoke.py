@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local end-to-end regression: TLS, SOCKS, multiplexing, flow control, FIN, auth."""
-import concurrent.futures, os, pathlib, secrets, socket, subprocess, tempfile, threading, time
+import concurrent.futures, os, pathlib, secrets, shutil, socket, subprocess, tempfile, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -38,9 +38,11 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--legacy-binaries', action='store_true', help='Test compatibility client/server launchers')
+    parser.add_argument('--h3', action='store_true', help='Exercise HTTP/3 via SOCKS5')
     args = parser.parse_args()
     args_namespace = args
     build = ['cargo', 'build', '--bins']
+    if args.h3: build += ['--features', 'h3']
     subprocess.run(build, cwd=ROOT, check=True)
     import json
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=ROOT))
@@ -61,7 +63,12 @@ def main():
     threading.Thread(target=accept, daemon=True).start()
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = pathlib.Path(tmp); key, cert = tmp/'key.pem', tmp/'cert.pem'
+            tmp = pathlib.Path(tmp)
+            snapshot = tmp/'bin'; snapshot.mkdir()
+            for name in ['client', 'server', 'foldfin']:
+                shutil.copy2(binaries/name, snapshot/name)
+            binaries = snapshot
+            key, cert = tmp/'key.pem', tmp/'cert.pem'
             subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
                             '-keyout', str(key), '-out', str(cert), '-subj', '/CN=localhost',
                             '-addext', 'subjectAltName=DNS:localhost',
@@ -71,6 +78,8 @@ def main():
             env = dict(os.environ, FOLDFIN_TOKEN=secrets.token_hex(32))
             def launch(binary, args, environment=env):
                 command = [str(binaries/binary)] if args_namespace.legacy_binaries else [str(binaries/"foldfin"), binary]
+                if args_namespace.h3:
+                    args = [*args, *(['--h3'] if binary == 'server' else ['--transport', 'h3'])]
                 p = subprocess.Popen([*command, *args], env=environment)
                 processes.append(p); return p
             server = launch('server', ['--listen', f'127.0.0.1:{server_port}', '--cert', str(cert), '--key', str(key), '--allow-private'])
@@ -112,7 +121,9 @@ def main():
                     assert status == 0
                     upstream, _ = idle.accept()
                     with upstream:
-                        upstream.settimeout(5)
+                        # Abrupt UDP process death has no FIN/RST. The existing
+                        # 45-second QUIC idle timeout bounds remote cleanup.
+                        upstream.settimeout(55 if args_namespace.h3 else 5)
                         client.kill(); client.wait(timeout=5)
                         assert upstream.recv(1) == b'', 'upstream leaked after carrier loss'
             print('PASS: 8 concurrent 512KiB flows, half-close, wrong token, untrusted certificate, wrong TLS name, private destination rejection, upstream cleanup on carrier loss')

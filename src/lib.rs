@@ -175,3 +175,6 @@ mod tests {
         assert!(public_ip("1.1.1.1".parse().unwrap()));
     }
 }
+
+#[cfg(all(feature = "client", feature = "h3"))]
+pub mod h3_tcp;

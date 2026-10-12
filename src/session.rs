@@ -42,13 +42,13 @@ impl From<crate::h3_client::Client> for Carrier {
         Self::H3(client)
     }
 }
-enum Prepared {
+pub(crate) enum Prepared {
     H2(crate::client::PreparedVpn),
     #[cfg(feature = "h3")]
     H3(Box<crate::h3_client::PreparedVpn>),
 }
 impl Prepared {
-    fn start(self, device: PacketDevice) -> VpnTunnel {
+    pub(crate) fn start(self, device: PacketDevice) -> VpnTunnel {
         match self {
             Self::H2(p) => p.start(device),
             #[cfg(feature = "h3")]
@@ -56,8 +56,32 @@ impl Prepared {
         }
     }
 }
+/// Transport-neutral TCP flow used by host proxy adapters.
+pub trait TcpStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TcpStream for T {}
 impl Carrier {
-    async fn prepare_vpn(&self, config: vpn::Config) -> Result<Prepared> {
+    pub async fn open_tcp(&self, target: &str) -> Result<Box<dyn TcpStream>> {
+        match self {
+            Self::H2(client) => Ok(Box::new(client.open_tcp(target).await?)),
+            #[cfg(feature = "h3")]
+            Self::H3(client) => Ok(Box::new(client.open_tcp(target).await?)),
+        }
+    }
+    pub async fn closed(&self) {
+        match self {
+            Self::H2(client) => {
+                let mut state = client.subscribe();
+                while matches!(*state.borrow_and_update(), SessionState::Running) {
+                    if state.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            #[cfg(feature = "h3")]
+            Self::H3(client) => client.closed().await,
+        }
+    }
+    pub(crate) async fn prepare_vpn(&self, config: vpn::Config) -> Result<Prepared> {
         match self {
             Self::H2(c) => c.prepare_vpn(config).await.map(Prepared::H2),
             #[cfg(feature = "h3")]

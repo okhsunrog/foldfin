@@ -8,7 +8,13 @@ foldfin = { path = "../foldfin", default-features = false, features = ["client"]
 ```
 
 `client` and `server` enable rustls TLS. Optional `h3` enables the experimental
-HTTP/3 carrier. Chrome/BoringSSL support has been removed.
+HTTP/3 carrier and CONNECT/CONNECT-IP roles. `h3_client::Client::connect_over`
+accepts a host-prepared UDP socket and resolved endpoint; `open_tcp` returns an
+AsyncRead/AsyncWrite flow with independent half-close and bounded writes.
+`session::Carrier` accepts either client and lets the SOCKS adapter share both.
+`Server::serve_h3` accepts a host-prepared UDP socket; H2 and H3 listeners on one
+Server share authorization, admission and limits. Chrome/BoringSSL support has
+been removed.
 `cli` adds argument parsing, file/env handling, logging initialization and
 process signals. Defaults include both roles and CLI for standalone development.
 Library consumers should disable defaults. The crate doesn't install a runtime

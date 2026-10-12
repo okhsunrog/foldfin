@@ -1,6 +1,6 @@
 # Foldfin — general-purpose VPN project
 
-The product goal is one client with two modes: a per-application TCP proxy and a device-level IP VPN. The proxy works; a Linux TUN / CONNECT-IP prototype now carries IP between one statically configured pair of peers. Explicit routed subnets are supported; automatic full-tunnel internet setup is not implemented yet. Mode and carrier are independent: both use TLS/H2, with H3 datagrams as a later option. See [the product goals](docs/GOALS.md) and [the VPN design](docs/VPN-DESIGN.md).
+The product goal is one client with two modes: a per-application TCP proxy and a device-level IP VPN. The proxy works; a Linux TUN / CONNECT-IP prototype now carries IP between one statically configured pair of peers. Explicit routed subnets are supported; automatic full-tunnel internet setup is not implemented yet. Mode and carrier are independent: both support H2/rustls and optional H3/Quinn. See [the product goals](docs/GOALS.md) and [the VPN design](docs/VPN-DESIGN.md).
 
 ```
 Application → SOCKS5 (localhost) → TLS / HTTP2 CONNECT → server → destination TCP
@@ -69,7 +69,15 @@ parallel HTTPS, egress IP, authentication and private destination rejection.
 
 The Chrome/BoringSSL backend has been removed. H2 uses rustls; the optional
 `h3` carrier uses Quinn/rustls, prepared UDP sockets and HTTP Datagrams.
-The CLI VPN still uses H2 while session and H3 integration are in progress.
+Build with `cargo build --release --features h3`. Start the server with `--h3`
+to listen on both TCP and UDP at `--listen`; select `--transport h3` on the client
+for either SOCKS5 TCP or CONNECT-IP VPN. H2 remains the CLI default. Prepare the
+TUN with MTU 1280 for H3; no fragmentation or automatic OS network setup is added.
+Floppa's Auto policy tries H3 for two seconds before permitted H2 fallback.
+
+Local acceptance: `uv run tests/smoke.py --h3` and
+`uv run tests/vpn_netns.py --routed --h3`. Abrupt UDP carrier loss uses the existing
+45-second QUIC idle timeout; graceful shutdown closes immediately.
 See [implementation status](docs/IMPLEMENTATION.md).
 
 Historical Chrome 154 measurements remain under `profiles/` and `docs/`.

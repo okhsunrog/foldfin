@@ -79,6 +79,23 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
 - Local regressions cover H2 -> H3 -> H2 with one packet device, full-MTU H3
   packet transfer, early DATAGRAM capsules, queue byte/age limits and budget release.
   Floppa manager regressions cover H3 recovery/replacement/revocation and Auto
-  fallback with bound but unresponsive UDP. H3 is still optional; CLI transport
-  selection and CONNECT-UDP are not yet implemented. The 100 ms age policy covers
+  fallback with bound but unresponsive UDP. H3 is still optional; CONNECT-UDP is not yet implemented. The 100 ms age policy covers
   the application receive queue; expiry inside Quinn's outbound queue is still open.
+
+- HTTP/3 TCP flows implement bounded AsyncRead/AsyncWrite without per-flow tasks.
+  Half-close preserves response reads and cancellation closes upstream TCP.
+  CLI/SOCKS transport selection now supports H3; a server can listen on both TCP
+  and UDP using one admission registry. A third isolated h3 vendor correction
+  omits :scheme/:path in classic CONNECT as required by RFC 9114 section 4.4.
+
+- H3 CLI acceptance passed: eight concurrent 512 KiB SOCKS flows, independent FIN,
+  token/certificate/name/private-target rejection, and upstream cleanup after
+  abrupt process death. The existing 45-second QUIC idle timeout bounds the latter.
+- Routed H3 namespace acceptance passed for IPv4/IPv6 TCP/UDP/DNS/ICMP, reverse
+  connections, full 1280-byte packets, MTU rejection, 10 ms delay/1% outer loss,
+  SIGTERM/reconnect and namespace cleanup. SIGTERM now closes the carrier gracefully.
+  Test harnesses snapshot their binaries so concurrent Cargo builds cannot change
+  transport support midway through recovery checks. No host routes were changed.
+- H3 TCP backpressure passed with 128 MiB in each direction and deliberately held
+  readers. Both directions stall and resume while preserving payload and FIN.
+  Full latency/loss matrix, physical Android and isolated Singapore remain pending.

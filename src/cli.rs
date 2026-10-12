@@ -3,6 +3,7 @@ use crate::{
     client::{Client, ClientConfig},
     credential::Credential,
     server::{Server, ServerConfig},
+    session::Carrier,
 };
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
@@ -50,6 +51,24 @@ fn credential() -> Result<Credential> {
 }
 
 async fn shutdown() {
+    #[cfg(unix)]
+    {
+        // Service managers send SIGTERM. Close QUIC explicitly instead of
+        // leaving the peer's static VPN slot occupied until the idle timeout.
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => (),
+                    _ = terminate.recv() => (),
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "cannot register termination handler");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
 }
 
@@ -86,11 +105,19 @@ pub async fn server() -> Result<()> {
     run_server(ServerArgs::parse()).await
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Transport {
+    H2,
+    #[cfg(feature = "h3")]
+    H3,
+}
 #[derive(Parser)]
 pub struct ClientArgs {
     #[arg(long, default_value = "127.0.0.1:1080")]
     listen: SocketAddr,
-    /// TCP address, e.g. vpn.example.com:443; TLS name is set separately.
+    #[arg(long, value_enum, default_value = "h2")]
+    transport: Transport,
+    /// Server address, e.g. vpn.example.com:443; TLS name is set separately.
     #[arg(long)]
     server: String,
     #[arg(long)]
@@ -115,6 +142,10 @@ pub struct ClientArgs {
 
 #[derive(Parser)]
 pub struct ServerArgs {
+    /// Also serve HTTP/3 on UDP at the same listen address.
+    #[cfg(feature = "h3")]
+    #[arg(long)]
+    h3: bool,
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
     #[arg(long)]
@@ -167,8 +198,27 @@ async fn run_client(args: ClientArgs) -> Result<()> {
         credential: credential()?,
         additional_ca_pem: args.ca.map(std::fs::read).transpose()?,
     };
-    let tcp = timeout(crate::DEADLINE, TcpStream::connect(&args.server)).await??;
-    let client = Client::connect_over(config, tcp).await?;
+    let client: Carrier = match args.transport {
+        Transport::H2 => {
+            let tcp = timeout(crate::DEADLINE, TcpStream::connect(&args.server)).await??;
+            Client::connect_over(config, tcp).await?.into()
+        }
+        #[cfg(feature = "h3")]
+        Transport::H3 => {
+            let address = timeout(crate::DEADLINE, tokio::net::lookup_host(&args.server))
+                .await??
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("server has no resolved address"))?;
+            let socket = std::net::UdpSocket::bind(if address.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            })?;
+            crate::h3_client::Client::connect_over(config, socket, address)
+                .await?
+                .into()
+        }
+    };
     let result: Result<()> = if let Some(policy) = policy {
         #[cfg(target_os = "linux")]
         {
@@ -182,7 +232,11 @@ async fn run_client(args: ClientArgs) -> Result<()> {
             tracing::info!(
                 "CONNECT-IP ready on {} (static peer, MTU {})",
                 name,
-                crate::vpn::MTU
+                match args.transport {
+                    Transport::H2 => crate::vpn::MTU,
+                    #[cfg(feature = "h3")]
+                    Transport::H3 => 1280,
+                }
             );
             tokio::select! { _ = shutdown() => {}, _ = tunnel.closed() => {} }
             tunnel.stop().await.map_err(Into::into)
@@ -251,6 +305,37 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         allow_private: args.allow_private,
         vpn,
     })?;
+    #[cfg(feature = "h3")]
+    if args.h3 {
+        let tcp = TcpListener::bind(args.listen).await?;
+        let udp = std::net::UdpSocket::bind(tcp.local_addr()?)?;
+        let (cancel, mut first) = tokio::sync::watch::channel(false);
+        let mut second = first.clone();
+        let h2 = server.serve(tcp, async {
+            let _ = first.changed().await;
+        });
+        let h3 = server.serve_h3(udp, async {
+            let _ = second.changed().await;
+        });
+        tokio::pin!(h2, h3);
+        let (a, b) = tokio::select! {
+            result = &mut h2 => (Some(result), None),
+            result = &mut h3 => (None, Some(result)),
+            _ = shutdown() => (None, None),
+        };
+        cancel.send_replace(true);
+        let a = match a {
+            Some(result) => result,
+            None => h2.await,
+        };
+        let b = match b {
+            Some(result) => result,
+            None => h3.await,
+        };
+        a?;
+        b?;
+        return Ok(());
+    }
     server
         .serve(TcpListener::bind(args.listen).await?, shutdown())
         .await?;

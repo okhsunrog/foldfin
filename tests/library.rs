@@ -351,14 +351,33 @@ async fn embedded_tcp_half_close_stats_probe_and_cancellation() {
     tcp_acceptance().await;
 }
 
-async fn slow_reader_backpressure() {
+async fn slow_reader_backpressure(h3: bool) {
     // More payload than either receive window and the local socket buffers.
     // Keep only one chunk in the producer; holding a reader must stall its
     // writer, and resuming it must preserve all bytes and independent FINs.
     const CHUNK: usize = 64 * 1024;
     const CHUNKS: usize = 2048;
-    let fixture = Fixture::new(None).await;
-    let client = fixture.client().await;
+    let fixture = Fixture::new_with_transport(None, h3).await;
+    #[cfg(feature = "h3")]
+    let client: foldfin::session::Carrier = if h3 {
+        foldfin::h3_client::Client::connect_over(
+            ClientConfig {
+                authority: "localhost:8443".into(),
+                server_name: "localhost".into(),
+                credential: Credential::bearer(TOKEN).unwrap(),
+                additional_ca_pem: Some(fixture.certificate.clone()),
+            },
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            fixture.address,
+        )
+        .await
+        .unwrap()
+        .into()
+    } else {
+        fixture.client().await.into()
+    };
+    #[cfg(not(feature = "h3"))]
+    let client: foldfin::session::Carrier = fixture.client().await.into();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut flow = client
         .open_tcp(&listener.local_addr().unwrap().to_string())
@@ -427,7 +446,7 @@ async fn slow_reader_backpressure() {
 
 #[tokio::test]
 async fn rustls_slow_readers_preserve_bidirectional_backpressure() {
-    slow_reader_backpressure().await;
+    slow_reader_backpressure(false).await;
 }
 
 #[tokio::test]
@@ -710,4 +729,61 @@ async fn h3_accepts_early_datagram_capsules_without_losing_buffered_data() {
     drop(stream);
     client.stop().await;
     fixture.stop().await;
+}
+
+#[cfg(feature = "h3")]
+#[tokio::test]
+async fn h3_proxy_preserves_half_close_and_cancels_upstream_on_drop() {
+    let fixture = Fixture::new_with_transport(None, true).await;
+    let client = foldfin::h3_client::Client::connect_over(
+        ClientConfig {
+            authority: "localhost:8443".into(),
+            server_name: "localhost".into(),
+            credential: Credential::bearer(TOKEN).unwrap(),
+            additional_ca_pem: Some(fixture.certificate.clone()),
+        },
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        fixture.address,
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap().to_string();
+    let mut flow = client.open_tcp(&target).await.unwrap();
+    let (mut upstream, _) = listener.accept().await.unwrap();
+    let echo = tokio::spawn(async move {
+        let mut data = Vec::new();
+        upstream.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, vec![42; 256 * 1024]);
+        upstream.write_all(&data).await.unwrap();
+        upstream.shutdown().await.unwrap();
+    });
+    timeout(Duration::from_secs(5), async {
+        flow.write_all(&vec![42; 256 * 1024]).await.unwrap();
+        flow.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        flow.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, vec![42; 256 * 1024]);
+        echo.await.unwrap();
+    })
+    .await
+    .unwrap();
+    let cancelled = client.open_tcp(&target).await.unwrap();
+    let (mut upstream, _) = listener.accept().await.unwrap();
+    drop(cancelled);
+    let read = timeout(Duration::from_secs(3), upstream.read(&mut [0; 1]))
+        .await
+        .unwrap();
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "unfinished CONNECT must close upstream"
+    );
+    client.stop().await.unwrap();
+    fixture.stop().await;
+}
+
+#[cfg(feature = "h3")]
+#[tokio::test]
+async fn h3_slow_readers_preserve_bidirectional_backpressure() {
+    slow_reader_backpressure(true).await;
 }

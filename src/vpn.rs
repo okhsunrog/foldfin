@@ -711,14 +711,16 @@ pub(crate) async fn bridge_h3(
                     capsules.send(Bytes::copy_from_slice(packet));
                 } else {
                     let mut state = state.lock().unwrap();
+                    let was_confirmed = state.confirmed();
                     if let Some(reply) = state.apply(event, config)? {
                         ensure!(replies.len() < 16, "too many pending control replies");
                         replies.push(reply);
                     }
-                    if state.confirmed()
-                        && let Some(status) = &status
-                    {
-                        status.send_replace(crate::stats::SessionState::Running);
+                    if state.confirmed() && !was_confirmed {
+                        tracing::info!("CONNECT-IP configuration confirmed");
+                        if let Some(status) = &status {
+                            status.send_replace(crate::stats::SessionState::Running);
+                        }
                     }
                 }
                 Ok(())

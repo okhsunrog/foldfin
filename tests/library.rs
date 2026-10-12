@@ -1,7 +1,7 @@
 //! Embedding acceptance: no CLI, environment credentials, named TUN or OS changes.
 #![cfg(all(feature = "client", feature = "server"))]
 use foldfin::{
-    client::{Client, ClientConfig, TlsProfile},
+    client::{Client, ClientConfig},
     credential::Credential,
     packet::{PacketDevice, PacketDeviceFactory, PacketRecv, PacketSend},
     server::{Server, ServerConfig, VpnConfig},
@@ -99,14 +99,13 @@ impl Fixture {
         }
     }
 
-    async fn client(&self, tls_profile: TlsProfile) -> Client {
+    async fn client(&self) -> Client {
         Client::connect_over(
             ClientConfig {
                 authority: "localhost:8443".into(),
                 server_name: "localhost".into(),
                 credential: Credential::bearer(TOKEN).unwrap(),
                 additional_ca_pem: Some(self.certificate.clone()),
-                tls_profile,
             },
             TcpStream::connect(self.address).await.unwrap(),
         )
@@ -124,9 +123,9 @@ impl Fixture {
     }
 }
 
-async fn tcp_acceptance(tls_profile: TlsProfile) {
+async fn tcp_acceptance() {
     let fixture = Fixture::new(None).await;
-    let client = fixture.client(tls_profile).await;
+    let client = fixture.client().await;
     client.probe().await.unwrap();
     let endpoint = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = endpoint.local_addr().unwrap();
@@ -271,7 +270,7 @@ fn packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
     packet
 }
 
-async fn vpn_acceptance(tls_profile: TlsProfile) {
+async fn vpn_acceptance() {
     let server_drops = Arc::new(AtomicUsize::new(0));
     let client_drops = Arc::new(AtomicUsize::new(0));
     let (server_device, server_tx, mut server_rx) = device(server_drops.clone());
@@ -280,7 +279,7 @@ async fn vpn_acceptance(tls_profile: TlsProfile) {
         device: Arc::new(Factory(Mutex::new(Some(server_device)))),
     }))
     .await;
-    let client = fixture.client(tls_profile).await;
+    let client = fixture.client().await;
     let prepared = client
         .prepare_vpn(config("198.18.0.1", "198.18.0.2"))
         .await
@@ -335,17 +334,17 @@ fn credentials_are_redacted_and_validation_does_not_read_environment() {
 
 #[tokio::test]
 async fn embedded_tcp_half_close_stats_probe_and_cancellation() {
-    tcp_acceptance(TlsProfile::Rustls).await;
+    tcp_acceptance().await;
 }
 
-async fn slow_reader_backpressure(tls_profile: TlsProfile) {
+async fn slow_reader_backpressure() {
     // More payload than either receive window and the local socket buffers.
     // Keep only one chunk in the producer; holding a reader must stall its
     // writer, and resuming it must preserve all bytes and independent FINs.
     const CHUNK: usize = 64 * 1024;
     const CHUNKS: usize = 2048;
     let fixture = Fixture::new(None).await;
-    let client = fixture.client(tls_profile).await;
+    let client = fixture.client().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut flow = client
         .open_tcp(&listener.local_addr().unwrap().to_string())
@@ -414,25 +413,10 @@ async fn slow_reader_backpressure(tls_profile: TlsProfile) {
 
 #[tokio::test]
 async fn rustls_slow_readers_preserve_bidirectional_backpressure() {
-    slow_reader_backpressure(TlsProfile::Rustls).await;
+    slow_reader_backpressure().await;
 }
 
-#[cfg(feature = "chrome-tls")]
-#[tokio::test]
-async fn chrome_slow_readers_preserve_bidirectional_backpressure() {
-    slow_reader_backpressure(TlsProfile::Chrome154Linux).await;
-}
 #[tokio::test]
 async fn embedded_vpn_uses_packet_io_and_releases_owned_endpoints() {
-    vpn_acceptance(TlsProfile::Rustls).await;
-}
-#[cfg(feature = "chrome-tls")]
-#[tokio::test]
-async fn chrome_tcp_library_api() {
-    tcp_acceptance(TlsProfile::Chrome154Linux).await;
-}
-#[cfg(feature = "chrome-tls")]
-#[tokio::test]
-async fn chrome_vpn_library_api() {
-    vpn_acceptance(TlsProfile::Chrome154Linux).await;
+    vpn_acceptance().await;
 }

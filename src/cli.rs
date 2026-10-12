@@ -1,6 +1,6 @@
 //! Process adapters for the CLI and legacy client/server launchers.
 use crate::{
-    client::{Client, ClientConfig, TlsProfile},
+    client::{Client, ClientConfig},
     credential::Credential,
     server::{Server, ServerConfig},
 };
@@ -98,9 +98,6 @@ pub struct ClientArgs {
     /// Additional trusted PEM CA certificate. Never disables verification.
     #[arg(long)]
     ca: Option<PathBuf>,
-    /// Experimental captured Chrome TLS profile (requires chrome-tls feature).
-    #[arg(long)]
-    chrome_tls: bool,
     /// Use VPN instead of SOCKS, attaching to an already prepared Linux TUN.
     #[arg(long)]
     tun: Option<String>,
@@ -169,11 +166,6 @@ async fn run_client(args: ClientArgs) -> Result<()> {
         server_name: args.server_name,
         credential: credential()?,
         additional_ca_pem: args.ca.map(std::fs::read).transpose()?,
-        tls_profile: if args.chrome_tls {
-            TlsProfile::Chrome154Linux
-        } else {
-            TlsProfile::Rustls
-        },
     };
     let tcp = timeout(crate::DEADLINE, TcpStream::connect(&args.server)).await??;
     let client = Client::connect_over(config, tcp).await?;

@@ -37,14 +37,10 @@ def connect(port, dest):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--chrome-tls', action='store_true')
     parser.add_argument('--legacy-binaries', action='store_true', help='Test compatibility client/server launchers')
     args = parser.parse_args()
     args_namespace = args
-    chrome_tls = args.chrome_tls
     build = ['cargo', 'build', '--bins']
-    if args.chrome_tls:
-        build += ['--features', 'chrome-tls']
     subprocess.run(build, cwd=ROOT, check=True)
     import json
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=ROOT))
@@ -74,8 +70,6 @@ def main():
             server_port, socks_port, bad_port = free_port(), free_port(), free_port()
             env = dict(os.environ, FOLDFIN_TOKEN=secrets.token_hex(32))
             def launch(binary, args, environment=env):
-                if binary == 'client' and chrome_tls:
-                    args = args + ['--chrome-tls']
                 command = [str(binaries/binary)] if args_namespace.legacy_binaries else [str(binaries/"foldfin"), binary]
                 p = subprocess.Popen([*command, *args], env=environment)
                 processes.append(p); return p

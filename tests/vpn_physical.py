@@ -31,7 +31,7 @@ def main():
     parser.add_argument('--interface')
     parser.add_argument('--seconds', type=int, default=12)
     parser.add_argument('--repeats', type=int, default=2)
-    parser.add_argument('--profiles', nargs='+', choices=['rustls', 'chrome'], default=['rustls', 'chrome'])
+    parser.add_argument('--profiles', nargs='+', choices=['rustls'], default=['rustls'])
     parser.add_argument('--accept-only', action='store_true')
     parser.add_argument('--telemetry', action='store_true')
     args = parser.parse_args()
@@ -202,8 +202,7 @@ def main():
                     client = launch(name, binary, 'client', '--server', f'{address}:{port}',
                         '--server-name', cfg['FOLDFIN_SERVER_NAME'], '--ca', args.configs/'singapore.pem',
                         *(['--tun', 'ffvpn0', '--vpn-local', '198.18.78.2', '--vpn-peer', '198.18.78.1',
-                           '--vpn-peer-routes', '198.19.78.0/30'] if mode == 'tun' else []),
-                        *(['--chrome-tls'] if profile == 'chrome' else []))
+                           '--vpn-peer-routes', '198.19.78.0/30'] if mode == 'tun' else []))
                     ready(client, name, 'configuration confirmed' if mode == 'tun' else 'SOCKS5 listening')
                 if mode == 'tun':
                     echo = launch(name+'-echo', sys.executable, ROOT/'tests/vpn_netns.py', '--worker', 'echo',

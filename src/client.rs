@@ -23,14 +23,6 @@ use tokio::{
 };
 use tokio_rustls::{TlsConnector, rustls};
 
-#[derive(Clone, Copy, Debug, Default)]
-pub enum TlsProfile {
-    #[default]
-    Rustls,
-    /// The measured Chrome 154 Linux profile, not a generic browser fingerprint.
-    Chrome154Linux,
-}
-
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     /// HTTP authority used by CONNECT-IP, independent of the dialled IP.
@@ -39,11 +31,7 @@ pub struct ClientConfig {
     pub server_name: String,
     pub credential: Credential,
     pub additional_ca_pem: Option<Vec<u8>>,
-    pub tls_profile: TlsProfile,
 }
-
-trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 
 struct Inner {
     sender: h2::client::SendRequest<Bytes>,
@@ -82,75 +70,37 @@ impl Client {
             ));
         }
         tcp.set_nodelay(true)?;
-        let tls: Box<dyn Transport> = match config.tls_profile {
-            TlsProfile::Chrome154Linux => {
-                #[cfg(feature = "chrome-tls")]
-                {
-                    Box::new(
-                        timeout(
-                            crate::DEADLINE,
-                            crate::chrome_tls::connect(
-                                tcp,
-                                &config.server_name,
-                                config.additional_ca_pem.as_deref(),
-                            ),
-                        )
-                        .await
-                        .map_err(|_| Error::Timeout("TLS handshake"))?
-                        .map_err(Error::Tls)?,
-                    )
-                }
-                #[cfg(not(feature = "chrome-tls"))]
-                {
-                    return Err(Error::Unsupported(
-                        "build with chrome-tls for Chrome154Linux",
-                    ));
-                }
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(pem) = &config.additional_ca_pem {
+            for cert in rustls_pemfile::certs(&mut &pem[..]) {
+                roots.add(cert?).map_err(|e| Error::Tls(e.into()))?;
             }
-            TlsProfile::Rustls => {
-                let mut roots = rustls::RootCertStore::empty();
-                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                if let Some(pem) = &config.additional_ca_pem {
-                    for cert in rustls_pemfile::certs(&mut &pem[..]) {
-                        roots.add(cert?).map_err(|e| Error::Tls(e.into()))?;
-                    }
-                }
-                let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .map_err(|e| Error::Tls(e.into()))?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-                tls_config.alpn_protocols = vec![b"h2".to_vec()];
-                let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
-                    .map_err(|e| Error::InvalidConfig(e.to_string()))?;
-                let tls = timeout(
-                    crate::DEADLINE,
-                    TlsConnector::from(Arc::new(tls_config)).connect(name, tcp),
-                )
-                .await
-                .map_err(|_| Error::Timeout("TLS handshake"))?
-                .map_err(|e| Error::Tls(e.into()))?;
-                if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-                    return Err(Error::Unsupported("server did not negotiate h2"));
-                }
-                Box::new(tls)
-            }
-        };
-        let mut builder = h2::client::Builder::new();
-        if matches!(config.tls_profile, TlsProfile::Chrome154Linux) {
-            builder
-                .header_table_size(65_536)
-                .enable_push(false)
-                .initial_window_size(6 * 1024 * 1024)
-                .max_header_list_size(256 * 1024)
-                .initial_connection_window_size(15 * 1024 * 1024);
-        } else {
-            builder
-                .initial_window_size(crate::h2_window::RECEIVE_WINDOW)
-                .initial_connection_window_size(crate::h2_window::RECEIVE_WINDOW);
         }
+        let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Tls(e.into()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
+        let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
+            .map_err(|e| Error::InvalidConfig(e.to_string()))?;
+        let tls = timeout(
+            crate::DEADLINE,
+            TlsConnector::from(Arc::new(tls_config)).connect(name, tcp),
+        )
+        .await
+        .map_err(|_| Error::Timeout("TLS handshake"))?
+        .map_err(|e| Error::Tls(e.into()))?;
+        if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+            return Err(Error::Unsupported("server did not negotiate h2"));
+        }
+        let mut builder = h2::client::Builder::new();
+        builder
+            .initial_window_size(crate::h2_window::RECEIVE_WINDOW)
+            .initial_connection_window_size(crate::h2_window::RECEIVE_WINDOW);
         let (sender, mut connection) = timeout(crate::DEADLINE, builder.handshake(tls))
             .await
             .map_err(|_| Error::Timeout("H2 handshake"))??;

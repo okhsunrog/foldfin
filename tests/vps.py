@@ -43,7 +43,6 @@ def main():
     parser.add_argument('--configs', type=pathlib.Path, default=ROOT.parent.parent / 'cloud-forge/generated_configs/foldfin')
     parser.add_argument('--hosts', nargs='+', choices=['europe', 'moscow', 'singapore'], default=['singapore'])
     parser.add_argument('--client', type=pathlib.Path, help='explicit locally built client binary')
-    parser.add_argument('--chrome-tls', action='store_true')
     args = parser.parse_args()
     if args.client:
         binary = args.client
@@ -56,8 +55,6 @@ def main():
         socks = free_port()
         client_args = [str(binary), '--server', config['FOLDFIN_SERVER'], '--server-name', config['FOLDFIN_SERVER_NAME'],
                        '--ca', str(args.configs / f'{host}.pem'), '--listen', f'127.0.0.1:{socks}']
-        if args.chrome_tls:
-            client_args.insert(1, '--chrome-tls')
         # Capture stderr rather than printing environment or command token values.
         client = subprocess.Popen(client_args, env=dict(os.environ, FOLDFIN_TOKEN=config['FOLDFIN_TOKEN']), stderr=subprocess.PIPE)
         try:

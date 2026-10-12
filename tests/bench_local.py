@@ -38,8 +38,8 @@ def main():
     parser.add_argument('--tun-queue', type=int, default=500, help='TUN driver queue length in test namespaces only')
     parser.add_argument('--netem-placement', choices=['egress', 'ingress'], default='egress')
     parser.add_argument('--tcp-wmem-max', type=int, help='TCP autotune send maximum in test namespaces only')
-    parser.add_argument('--profiles', nargs='+', choices=['rustls', 'chrome'],
-                        default=['rustls', 'chrome'])
+    parser.add_argument('--profiles', nargs='+', choices=['rustls'],
+                        default=['rustls'])
     args = parser.parse_args()
     assert 3 <= args.seconds <= 60 and 1 <= args.repeats <= 5
     assert 0 <= args.rtt_ms <= 1000 and 0 <= args.loss_percent <= 5
@@ -202,8 +202,7 @@ def main():
                                     '--server', '192.0.2.2:8443', '--server-name', 'localhost',
                                     '--ca', cert,
                                     *(['--tun', 'ffvpn0', '--vpn-local', '198.18.0.1', '--vpn-peer', '198.18.0.2']
-                                      if mode == 'tun' else ['--listen', '127.0.0.1:1080']),
-                                    *(['--chrome-tls'] if profile == 'chrome' else []))
+                                      if mode == 'tun' else ['--listen', '127.0.0.1:1080']))
                     ready(client, label+'-client', 'configuration confirmed' if mode == 'tun' else 'SOCKS5 listening')
                 for repeat in range(args.repeats):
                     for reverse in [False, True]:

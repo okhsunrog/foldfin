@@ -111,7 +111,6 @@ def main():
     parser.add_argument('--chrome', default='/opt/google/chrome/google-chrome')
     parser.add_argument('--samples', type=int, default=3)
     parser.add_argument('--output', type=pathlib.Path, default=ROOT / 'captures/baseline')
-    parser.add_argument('--chrome-tls', action='store_true', help='capture the experimental Foldfin backend')
     args = parser.parse_args()
     if args.samples < 1:
         parser.error('--samples must be positive')
@@ -121,8 +120,6 @@ def main():
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=ROOT))
     binary = pathlib.Path(metadata['target_directory']) / 'debug/client'
     build = ['cargo', 'build', '--bin', 'client']
-    if args.chrome_tls:
-        build += ['--features', 'chrome-tls']
     subprocess.run(build, cwd=ROOT, check=True)
     listener = socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen(); listener.settimeout(.2)
     port = listener.getsockname()[1]
@@ -167,8 +164,6 @@ def main():
                                    f'--user-data-dir={profile}', '--dump-dom', f'https://localhost:{port}/']
                     else:
                         command = [str(binary), '--server', f'127.0.0.1:{port}', '--server-name', 'localhost']
-                        if args.chrome_tls:
-                            command.append('--chrome-tls')
                     process = subprocess.Popen(command, env=dict(os.environ, FOLDFIN_TOKEN='0' * 64),
                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     try:
@@ -181,7 +176,7 @@ def main():
                             process.kill(); process.wait()
                 assert len(samples) > count, f'no ClientHello captured for {source}'
         version = subprocess.check_output([args.chrome, '--version']).decode().strip()
-        report = {'chrome_version': version, 'foldfin_backend': 'chrome-tls' if args.chrome_tls else 'rustls',
+        report = {'chrome_version': version, 'foldfin_backend': 'rustls',
                   'endpoint': f'localhost:{port}', 'samples': samples}
         (args.output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
         print(f'{version}; captured {len(samples)} ClientHellos in {args.output}')

@@ -11,7 +11,7 @@ Android owns its system lockdown policy. No protocol-owned kill switch.
 - [x] Fix packet collector fairness and capsule request/response bounds.
 - [ ] H3 vertical slice with caller-owned UDP sockets and TLS validation.
 - [ ] Transport-independent sessions, bounded queues, recovery and multi-peer router.
-- [ ] Remove Chrome backend; update CLI and regression harnesses.
+- [x] Remove Chrome backend; update CLI and regression harnesses.
 - [ ] Floppa config v2, dual-stack NetworkPlan, Underlay, Recovering and typed health.
 - [ ] Floppa node binary, provisioning, versioned grant synchronization and metrics.
 - [ ] Local dual-stack, loss/latency, multi-peer and lifecycle acceptance.
@@ -45,3 +45,7 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
 - Published h3 0.0.8 lacks CONNECT-IP and h3-datagram 0.0.2 discards the encoded
   stream ID. Minimal vendored patches are documented in vendor/README.md.
   They must also be applied at embedding workspace roots.
+- Chrome/BoringSSL backend, profile selector, native dependencies and build/test
+  switches removed. Floppa's importing adapter updated to the rustls-only client
+  API. Existing measurements remain historical. H2 proxy and Floppa's three
+  integration tests pass after the removal.

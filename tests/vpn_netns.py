@@ -85,7 +85,6 @@ def worker(role, address, expected_source=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--chrome-tls', action='store_true')
     parser.add_argument('--no-build', action='store_true', help='Reuse the current debug binaries')
     parser.add_argument('--binary', type=pathlib.Path, help='Use one already-built foldfin CLI for both roles')
     parser.add_argument('--output', type=pathlib.Path, help='Retain logs and packet metadata, without TLS keys')
@@ -103,7 +102,6 @@ def main():
         args.output.chmod(0o700)
     subprocess.run(['sudo', '-n', 'true'], check=True)
     build = ['cargo', 'build', '--bins']
-    if args.chrome_tls: build += ['--features', 'chrome-tls']
     if not args.no_build and not args.binary:
         subprocess.run(build, cwd=ROOT, check=True)
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=ROOT))
@@ -206,7 +204,6 @@ def main():
                 client_args = [binaries/'client', '--server', '192.0.2.2:8443', '--server-name', 'localhost', '--ca', cert,
                     '--tun', 'ffvpn0', '--vpn-local', '198.18.0.1,fd42:6d69:6d69::1', '--vpn-peer', '198.18.0.2,fd42:6d69:6d69::2']
                 if args.routed: client_args += ['--vpn-peer-routes', '198.19.0.0/24,fd42:6d69:6c61::/64']
-                if args.chrome_tls: client_args += ['--chrome-tls']
                 client = launch(client_ns, client_log, *client_args)
                 wait_log(tmp/'client.log', 'CONNECT-IP ready', client)
                 wait_log(tmp/'client.log', 'configuration confirmed', client)

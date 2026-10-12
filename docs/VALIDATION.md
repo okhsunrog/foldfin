@@ -487,3 +487,11 @@ match before/after. Foldfin remains active, deployed SHA-256
 Quick-update now targets Singapore instead of its stale Frankfurt host/guard;
 runtime verification passed with `changed=0`. Historical Frankfurt tests remain
 disabled.
+
+## Transport migration (2026-10-12)
+
+Chrome/BoringSSL has been removed from the current source and Floppa adapter.
+Earlier commands/results using `chrome-tls` below are historical. Current builds
+use rustls; `cargo test --features h3` additionally tests the experimental H3
+carrier, including independent streams, datagrams and certificate failures.
+The H3 carrier is not yet wired into CLI VPN or Floppa's transport selection.

@@ -7,8 +7,8 @@ foldfin = { path = "../foldfin", default-features = false, features = ["client"]
 # Server host: features = ["server"]. Either host may enable both roles.
 ```
 
-`client` and `server` enable the rustls TLS dependencies. `chrome-tls` adds the
-measured Chrome 154 Linux client profile and its native BoringSSL build.
+`client` and `server` enable rustls TLS. Optional `h3` enables the experimental
+HTTP/3 carrier. Chrome/BoringSSL support has been removed.
 `cli` adds argument parsing, file/env handling, logging initialization and
 process signals. Defaults include both roles and CLI for standalone development.
 Library consumers should disable defaults. The crate doesn't install a runtime
@@ -19,7 +19,7 @@ or tracing subscriber, and credentials are never read from the environment.
 ```rust,no_run
 # #[cfg(feature = "client")]
 # async fn example() -> foldfin::error::Result<()> {
-use foldfin::{client::{Client, ClientConfig, TlsProfile}, credential::Credential};
+use foldfin::{client::{Client, ClientConfig}, credential::Credential};
 use tokio::net::TcpStream;
 
 let config = ClientConfig {
@@ -27,7 +27,6 @@ let config = ClientConfig {
     server_name: "vpn.example.org".into(),
     credential: Credential::bearer("0123456789abcdef0123456789abcdef")?,
     additional_ca_pem: None,
-    tls_profile: TlsProfile::Rustls,
 };
 // The host resolves, creates, protects/marks/binds and connects the TCP socket.
 let tcp = TcpStream::connect("vpn.example.org:443").await?;
@@ -151,8 +150,7 @@ probe as reachability evidence after capsule configuration is confirmed.
 ## Receive credit and long-RTT performance
 
 The normal client advertises 32 MiB stream and connection receive windows per
-carrier. The Chrome 154 client keeps its measured 6 MiB stream / 15 MiB
-connection profile. Both retain consumption-driven capacity release: a blocked
+carrier. Capacity release follows consumption: a blocked
 TCP or packet-device writer does not release the corresponding receive credit.
 
 The server advertises a 32 MiB stream window. Connection receive credit starts

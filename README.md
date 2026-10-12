@@ -18,12 +18,12 @@ filenames use the same project name; raw captured packet bytes are preserved.
 
 One crate provides `foldfin::client` and `foldfin::server`. To embed it, disable
 default features and select `client`, `server`, or both. CLI dependencies are
-optional; `chrome-tls` enables the measured Chrome 154 Linux profile.
+optional. The experimental `h3` feature adds a separately tested HTTP/3 carrier.
 
 See [LIBRARY.md](docs/LIBRARY.md) for ownership, lifecycle and integration examples.
 The CLI uses these same APIs. The IP core is platform independent; Linux and
 Android have an owned nonblocking FD adapter. Android runtime behavior and
-Chrome Android fingerprints are not established by host acceptance.
+Android behavior is not established by host acceptance.
 
 ## Build
 
@@ -65,54 +65,17 @@ certificates, the unit and firewall through the full Foldfin role. Set
 an existing release. Both deploy paths are restricted to `singapore`; tests check
 parallel HTTPS, egress IP, authentication and private destination rejection.
 
-## Experimental Chrome TLS profile
+## Transport migration
 
-The optional `chrome-tls` feature provides a BoringSSL client backend derived
-from the installed Linux Chrome 154.0.8037.92. Select it with `--chrome-tls`;
-the default client continues using rustls. Authorization and server policy are
-unchanged. Peer certificate and hostname verification remain enabled.
-For this profile, HTTP/2 client SETTINGS and the connection receive window also
-match the local Chrome capture.
+The Chrome/BoringSSL backend has been removed. H2 uses rustls; the optional
+`h3` carrier uses Quinn/rustls, prepared UDP sockets and HTTP Datagrams.
+The CLI VPN still uses H2 while session and H3 integration are in progress.
+See [implementation status](docs/IMPLEMENTATION.md).
 
-```sh
-cargo build --locked --features chrome-tls --bin foldfin
-./target/debug/foldfin client --chrome-tls --server sg.okhsunrog.dev:8445 \
-  --server-name sg.okhsunrog.dev --ca ../../cloud-forge/generated_configs/foldfin/singapore.pem
-# Supply FOLDFIN_TOKEN from the protected singapore.env as for the normal client.
-./scripts/test.sh --chrome-tls  # local profile build, Singapore acceptance only
-```
-
-The native build needs CMake, a C++ compiler and libclang. The bindings revision
-and BoringSSL submodule are pinned in Cargo.lock; the first build downloads them.
-Profile provenance is in [profiles/README.md](profiles/README.md).
-
-Capture and compare fresh handshakes on a loopback collector (dumpcap must have
-capture permission). Use a new directory for every run:
-
-```sh
-uv run scripts/fingerprint.py --output captures/new-baseline
-uv run scripts/fingerprint.py --chrome-tls --samples 5 --output captures/new-chrome
-uv run scripts/compare-fingerprints.py captures/new-chrome --require-match
-```
-
-Captures stop the connection after ClientHello, before TLS authentication or
-application traffic. Comparison normalizes GREASE values, cryptographic random
-bytes and the order of permuted extensions; it reports ECH GREASE payload length
-and TLS record length separately. This checks ClientHello properties, not full
-browser equivalence. Capture and inspect HTTP/2 SETTINGS and request frames with
-a local TLS peer:
-
-```sh
-uv run python tests/http2_capture.py
-```
-
-This uses a dummy token, redacts credential fields from its report and removes
-the temporary TLS key log after decoding. Chrome's SETTINGS and connection
-WINDOW_UPDATE are reproduced. Chrome sends browser GET requests; Foldfin sends
-CONNECT with authorization and keeps the stream open for tunneled TCP. Request
-headers and HEADERS priority flags therefore remain different. Resumption, ECH
-with a real DNS configuration, server behavior and traffic statistics need
-separate measurement. ECH GREASE does not encrypt or conceal the real SNI.
+Historical Chrome 154 measurements remain under `profiles/` and `docs/`.
+They describe the baseline implementation, not the current handshake.
+Fingerprint tools can compare the current rustls handshake with a browser;
+no matching or browser-equivalence claim is made.
 
 ## Local experiment
 
@@ -145,7 +108,7 @@ TCP CONNECT on the server. Both require `--vpn-local IP[,IP]` and
 `--vpn-peer IP[,IP]`, with one address per enabled IP version. The server allows
 one active IP tunnel because the prototype attaches one exclusive TUN queue.
 This is unrelated to the peer's public source IP. Existing bearer authentication
-and TLS verification also apply to CONNECT-IP; the Chrome backend is available.
+and TLS verification also apply to CONNECT-IP.
 
 The interface must already exist as a persistent TUN accessible to the process,
 with MTU 1500, addresses and explicit routes configured externally. The binaries
@@ -162,10 +125,6 @@ Run actual dual-stack TUN acceptance in disposable network namespaces:
 
 ```sh
 uv run tests/vpn_netns.py
-uv run tests/vpn_netns.py --chrome-tls
-uv run tests/vpn_netns.py --routed --chrome-tls
-./scripts/test-vpn.sh --chrome-tls       # Singapore through the physical NIC
-./scripts/deploy-vpn-test.sh --chrome-tls # configure, deploy, proxy + VPN tests
 ```
 
 The script requires passwordless sudo for namespace setup, iproute2 (`ip`, `tc`),
@@ -206,10 +165,10 @@ actual WAN rates, acceptance and cleanup.
 
 For controlled local CLI/TUN measurements at a specified outer RTT, use
 `uv run --no-project tests/bench_local.py --output /tmp/foldfin-bench --rtt-ms 200`.
-It requires an already-built release CLI with `chrome-tls`, iperf3 and namespace
+It requires an already-built release CLI, iperf3 and namespace
 privileges. It changes only disposable namespaces. The normal client now uses
 larger H2 receive windows; the server shares a bounded extra-credit pool across
-connections. Chrome client SETTINGS stay unchanged. See the
+connections. See the
 [performance plan](docs/PERFORMANCE-PLAN.md) and
 [October 12 window results](docs/BENCHMARK-2026-10-12.md) and
 [TCP/TUN diagnosis](docs/BENCHMARK-TCP-2026-10-12.md). The latter identifies local
@@ -228,7 +187,7 @@ local results, not a new Singapore throughput measurement.
 
 ## Current limits and next work
 
-The proxy mode carries TCP only; the Linux VPN prototype carries full IP packets between static endpoints and configured routed networks. Foldfin is not yet the planned general-purpose VPN. The Chrome profile covers measured ClientHello fields and HTTP/2 connection settings, while CONNECT and CONNECT-IP still differ from browser GETs. TLS terminates directly at this server. There is no ordinary browser H1 fallback, full browser impersonation, QUIC, Noise, padding, automatic reconnect, stream migration, or traffic shaping. Calling it undetectable would be incorrect.
+The proxy mode carries TCP only; the Linux VPN prototype carries full IP packets between static endpoints and configured routed networks. Foldfin is not yet the planned general-purpose VPN. CONNECT and CONNECT-IP differ from browser GETs. TLS terminates directly at this server. There is no ordinary browser H1 fallback, full browser impersonation, Noise, padding, automatic reconnect, stream migration, or traffic shaping. Calling it undetectable would be incorrect.
 
 An authenticated user can proxy arbitrary permitted public TCP targets. This is a trusted-user prototype, not a multi-tenant service. Idle connections have no inactivity timeout; semaphore limits bound their count but do not prevent slot exhaustion. Keep it private during experiments. IPv6 policy is conservative and not a complete IANA special-purpose range database.
 

@@ -47,7 +47,6 @@ def relay_worker(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--chrome-tls', action='store_true')
     parser.add_argument('--no-build', action='store_true')
     parser.add_argument('--configs', type=pathlib.Path, default=ROOT.parent.parent/'cloud-forge/generated_configs/foldfin')
     parser.add_argument('--relay')
@@ -57,7 +56,6 @@ def main():
     subprocess.run(['sudo', '-n', 'true'], check=True)
     if not args.no_build:
         build = ['cargo', 'build', '--bin', 'client']
-        if args.chrome_tls: build += ['--features', 'chrome-tls']
         subprocess.run(build, cwd=ROOT, check=True)
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=ROOT))
     binary = pathlib.Path(metadata['target_directory'])/'debug/client'
@@ -122,7 +120,6 @@ def main():
                     client_args = [binary, '--server', '127.0.0.1:18445', '--server-name', config['FOLDFIN_SERVER_NAME'],
                         '--ca', args.configs/'europe.pem', '--tun', 'ffvpn0', '--vpn-local', '198.18.77.2',
                         '--vpn-peer', '198.18.77.1', '--vpn-peer-routes', '198.19.77.0/30']
-                    if args.chrome_tls: client_args += ['--chrome-tls']
                     client = launch(*client_args); wait('configuration confirmed', client)
                     echo = launch(sys.executable, ROOT/'tests/vpn_netns.py', '--worker', 'echo', '--address', '198.18.77.2', '--expect-source', '198.19.77.2')
                     time.sleep(.2)

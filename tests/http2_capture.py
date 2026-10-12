@@ -220,7 +220,7 @@ def one_capture(mode, out, cert, key, client_binary=None):
             finally:
                 profile.cleanup()
         else:
-            child = subprocess.Popen([str(client_binary), '--chrome-tls', '--server', f'127.0.0.1:{port}',
+            child = subprocess.Popen([str(client_binary), '--server', f'127.0.0.1:{port}',
                                      '--server-name', 'localhost', '--ca', str(cert),
                                      '--listen', f'127.0.0.1:{free_port()}'],
                                     env=dict(os.environ, FOLDFIN_TOKEN='0' * 64),
@@ -279,7 +279,7 @@ def main():
     if args.output.exists() and any(args.output.iterdir()):
         parser.error('output directory is not empty; choose a new directory')
     args.output.mkdir(parents=True, exist_ok=True)
-    subprocess.run(['cargo', 'build', '--locked', '--features', 'chrome-tls', '--bin', 'client'],
+    subprocess.run(['cargo', 'build', '--locked', '--bin', 'client'],
                    cwd=ROOT, check=True)
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'], cwd=ROOT))
     client = pathlib.Path(metadata['target_directory']) / 'debug/client'

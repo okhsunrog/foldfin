@@ -38,7 +38,7 @@ def main():
     raise SystemExit('Historical Frankfurt/Floppa benchmark is disabled. Use tests/vpn_physical.py for Singapore CLI/TUN measurements; see docs/BENCHMARKS.md.')
     assert 5 <= args.seconds <= 60 and 1 <= args.repeats <= 5
     if not args.no_build:
-        subprocess.run(['cargo', 'build', '--release', '-p', 'floppa', '--features', 'foldfin-chrome'], cwd=FLOPPA, check=True)
+        subprocess.run(['cargo', 'build', '--release', '-p', 'floppa', '--features', 'default'], cwd=FLOPPA, check=True)
     meta = json.loads(run('cargo', 'metadata', '--no-deps', '--format-version', '1', cwd=FLOPPA).stdout)
     binary = Path(meta['target_directory']) / 'release/floppa'
     config_dir = ROOT.parent.parent / 'cloud-forge/generated_configs/foldfin'
@@ -130,10 +130,10 @@ def main():
         time.sleep(.5)
         summary = {'timestamp_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'seconds':args.seconds, 'omit_seconds':2, 'repeats':args.repeats, 'endpoint':address, 'underlay_interface':dev, 'observed_outer_peer':public_ip, 'gateway':gateway, 'client_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(), 'server_sha256':ssh('sha256sum','/opt/foldfin/server').stdout.split()[0], 'client_cpu':run('lscpu').stdout, 'server_cpu':ssh('lscpu').stdout, 'results':[]}
         ca = (config_dir/'europe.pem').read_text()
-        for mode in ['direct', 'rustls', 'chrome']:
+        for mode in ['direct', 'rustls']:
             if mode != 'direct':
                 document = args.output/'private-config.json'
-                document.write_text(json.dumps({'protocol':'foldfin','config':{'version':1,'endpoint':f'{address}:{endpoint_port}','server_name':cfg['FOLDFIN_SERVER_NAME'],'token':cfg['FOLDFIN_TOKEN'],'address':'198.18.77.2/32','peer':'198.18.77.1','routes':['198.18.77.1/32','198.19.77.0/30'],'dns':[],'mtu':1280,'chrome_tls':mode=='chrome','additional_ca_pem':ca}}))
+                document.write_text(json.dumps({'protocol':'foldfin','config':{'version':1,'endpoint':f'{address}:{endpoint_port}','server_name':cfg['FOLDFIN_SERVER_NAME'],'token':cfg['FOLDFIN_TOKEN'],'address':'198.18.77.2/32','peer':'198.18.77.1','routes':['198.18.77.1/32','198.19.77.0/30'],'dns':[],'mtu':1280,'additional_ca_pem':ca}}))
                 document.chmod(0o600)
                 log = open(args.output/f'{mode}-client.log','w'); handles.append(log)
                 command=['sudo','-n','ip','netns','exec',namespace,'env',f'XDG_CONFIG_HOME={args.output}/config',str(binary),'connect','--config',str(document),'--no-dns']

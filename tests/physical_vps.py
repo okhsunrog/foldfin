@@ -46,7 +46,7 @@ def probe(address):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hosts',nargs='+',choices=list(SSH_USERS),default=['singapore'])
-    parser.add_argument('--profiles',nargs='+',choices=['rustls','chrome'],default=['rustls','chrome'])
+    parser.add_argument('--profiles',nargs='+',choices=['rustls'],default=['rustls'])
     parser.add_argument('--interface',help='physical interface, defaults to lowest-metric main-table default')
     parser.add_argument('--configs',type=Path,default=ROOT.parent.parent/'cloud-forge/generated_configs/foldfin')
     parser.add_argument('--client',type=Path)
@@ -58,7 +58,7 @@ def main():
     args.output.chmod(0o700)
     meta=json.loads(run('cargo','metadata','--no-deps','--format-version','1',cwd=ROOT).stdout)
     binary=args.client or Path(meta['target_directory'])/'release/client'
-    assert binary.is_file(),'build release client with chrome-tls first'
+    assert binary.is_file(),'build release client first'
     configs={host:configuration(args.configs,host) for host in args.hosts}
     addresses={host:socket.gethostbyname(cfg['FOLDFIN_SERVER_NAME']) for host,cfg in configs.items()}
     assert all(ipaddress.ip_address(ip).is_global for ip in addresses.values())
@@ -135,9 +135,7 @@ def main():
                 item['diagnostics']=diagnostics;save();continue
             item['profiles']={}
             for profile in args.profiles:
-                chrome=profile=='chrome'
                 cmd=[sys.executable,ROOT/'tests/vps.py','--configs',args.configs,'--hosts',host,'--client',binary]
-                if chrome:cmd+=['--chrome-tls']
                 result=ns('setpriv','--reuid',str(os.getuid()),'--regid',str(os.getgid()),'--clear-groups',*cmd,timeout=150,check=False)
                 (args.output/(host+'-'+profile+'.txt')).write_text(result.stdout+result.stderr)
                 item['profiles'][profile]={'passed':result.returncode==0,'returncode':result.returncode};save()

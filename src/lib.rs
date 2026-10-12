@@ -10,8 +10,6 @@ use h2::{RecvStream, SendStream};
 pub mod adapters;
 #[cfg(feature = "server")]
 pub mod authorization;
-#[cfg(feature = "chrome-tls")]
-pub mod chrome_tls;
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "client")]

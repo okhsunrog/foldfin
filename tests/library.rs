@@ -1,0 +1,438 @@
+//! Embedding acceptance: no CLI, environment credentials, named TUN or OS changes.
+#![cfg(all(feature = "client", feature = "server"))]
+use foldfin::{
+    client::{Client, ClientConfig, TlsProfile},
+    credential::Credential,
+    packet::{PacketDevice, PacketDeviceFactory, PacketRecv, PacketSend},
+    server::{Server, ServerConfig, VpnConfig},
+    stats::SessionState,
+};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
+use tokio_rustls::rustls;
+
+const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+struct Fixture {
+    address: SocketAddr,
+    certificate: Vec<u8>,
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<foldfin::error::Result<()>>,
+}
+
+impl Fixture {
+    async fn new(vpn: Option<VpnConfig>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key.pem");
+        let cert = dir.path().join("cert.pem");
+        assert!(
+            std::process::Command::new("openssl")
+                .args([
+                    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-keyout",
+                ])
+                .arg(&key)
+                .arg("-out")
+                .arg(&cert)
+                .args([
+                    "-subj",
+                    "/CN=localhost",
+                    "-addext",
+                    "subjectAltName=DNS:localhost",
+                    "-addext",
+                    "basicConstraints=critical,CA:FALSE",
+                    "-addext",
+                    "extendedKeyUsage=serverAuth",
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let certificate = std::fs::read(cert).unwrap();
+        let certs = rustls_pemfile::certs(&mut &certificate[..])
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut &std::fs::read(key).unwrap()[..])
+            .unwrap()
+            .unwrap();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let server = Server::new(ServerConfig {
+            tls: Arc::new(tls),
+            credential: Credential::bearer(TOKEN).unwrap(),
+            allow_private: true,
+            vpn,
+        })
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            server
+                .serve(listener, async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        Self {
+            address,
+            certificate,
+            stop,
+            task,
+        }
+    }
+
+    async fn client(&self, tls_profile: TlsProfile) -> Client {
+        Client::connect_over(
+            ClientConfig {
+                authority: "localhost:8443".into(),
+                server_name: "localhost".into(),
+                credential: Credential::bearer(TOKEN).unwrap(),
+                additional_ca_pem: Some(self.certificate.clone()),
+                tls_profile,
+            },
+            TcpStream::connect(self.address).await.unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        timeout(Duration::from_secs(3), self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+async fn tcp_acceptance(tls_profile: TlsProfile) {
+    let fixture = Fixture::new(None).await;
+    let client = fixture.client(tls_profile).await;
+    client.probe().await.unwrap();
+    let endpoint = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let echo = tokio::spawn(async move {
+        let (mut stream, _) = endpoint.accept().await.unwrap();
+        let mut payload = Vec::new();
+        stream.read_to_end(&mut payload).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+    });
+    let mut flow = client.open_tcp(&address.to_string()).await.unwrap();
+    let payload = vec![42; 512 * 1024];
+    timeout(Duration::from_secs(5), async {
+        flow.write_all(&payload).await.unwrap();
+        flow.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        flow.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, payload);
+        echo.await.unwrap();
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.stats().tx_bytes, payload.len() as u64);
+    assert_eq!(client.stats().rx_bytes, payload.len() as u64);
+    assert!(client.stats().since_last_payload.is_some());
+    drop(flow);
+
+    // Cancelling an unfinished flow must close its upstream socket.
+    let endpoint = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let flow = client
+        .open_tcp(&endpoint.local_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    let (mut upstream, _) = endpoint.accept().await.unwrap();
+    drop(flow);
+    assert_eq!(
+        timeout(Duration::from_secs(3), upstream.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+
+    // Awaited server shutdown also tears down an active upstream flow.
+    let flow = client
+        .open_tcp(&endpoint.local_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    let (mut upstream, _) = endpoint.accept().await.unwrap();
+    fixture.stop().await;
+    assert_eq!(
+        timeout(Duration::from_secs(3), upstream.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    let mut states = client.subscribe();
+    timeout(Duration::from_secs(3), async {
+        while matches!(*states.borrow_and_update(), SessionState::Running) {
+            states.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(client.open_tcp(&address.to_string()).await.is_err());
+    drop(flow);
+    client.stop().await.unwrap();
+}
+
+struct Reader(mpsc::UnboundedReceiver<Vec<u8>>, Arc<AtomicUsize>);
+struct Writer(mpsc::UnboundedSender<Vec<u8>>, Arc<AtomicUsize>);
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.1.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.1.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl PacketRecv for Reader {
+    fn poll_recv(&mut self, cx: &mut Context<'_>, buffer: &mut [u8]) -> Poll<io::Result<usize>> {
+        match std::task::ready!(self.0.poll_recv(cx)) {
+            Some(packet) if packet.len() <= buffer.len() => {
+                buffer[..packet.len()].copy_from_slice(&packet);
+                Poll::Ready(Ok(packet.len()))
+            }
+            Some(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet too large",
+            ))),
+            None => Poll::Ready(Ok(0)),
+        }
+    }
+}
+impl PacketSend for Writer {
+    fn poll_send(&mut self, _cx: &mut Context<'_>, packet: &[u8]) -> Poll<io::Result<()>> {
+        Poll::Ready(self.0.send(packet.to_vec()).map_err(io::Error::other))
+    }
+}
+type DeviceChannels = (
+    PacketDevice,
+    mpsc::UnboundedSender<Vec<u8>>,
+    mpsc::UnboundedReceiver<Vec<u8>>,
+);
+fn device(drops: Arc<AtomicUsize>) -> DeviceChannels {
+    let (inject, recv) = mpsc::unbounded_channel();
+    let (send, delivered) = mpsc::unbounded_channel();
+    (
+        PacketDevice::new(Reader(recv, drops.clone()), Writer(send, drops)),
+        inject,
+        delivered,
+    )
+}
+struct Factory(Mutex<Option<PacketDevice>>);
+impl PacketDeviceFactory for Factory {
+    fn open(&self) -> io::Result<PacketDevice> {
+        self.0
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| io::Error::other("device already opened"))
+    }
+}
+fn config(local: &str, peer: &str) -> foldfin::vpn::Config {
+    foldfin::vpn::Config {
+        local: vec![local.parse().unwrap()],
+        peer: vec![peer.parse().unwrap()],
+        local_routes: vec![],
+        peer_routes: vec![],
+    }
+}
+fn packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
+    let mut packet = vec![0; 28];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&28_u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 17;
+    packet[12..16].copy_from_slice(&source);
+    packet[16..20].copy_from_slice(&destination);
+    packet
+}
+
+async fn vpn_acceptance(tls_profile: TlsProfile) {
+    let server_drops = Arc::new(AtomicUsize::new(0));
+    let client_drops = Arc::new(AtomicUsize::new(0));
+    let (server_device, server_tx, mut server_rx) = device(server_drops.clone());
+    let fixture = Fixture::new(Some(VpnConfig {
+        policy: config("198.18.0.2", "198.18.0.1"),
+        device: Arc::new(Factory(Mutex::new(Some(server_device)))),
+    }))
+    .await;
+    let client = fixture.client(tls_profile).await;
+    let prepared = client
+        .prepare_vpn(config("198.18.0.1", "198.18.0.2"))
+        .await
+        .unwrap();
+    assert_eq!(prepared.network_plan().local[0].to_string(), "198.18.0.1");
+    let (client_device, client_tx, mut client_rx) = device(client_drops.clone());
+    let tunnel = prepared.start(client_device);
+    let mut states = tunnel.subscribe();
+    timeout(Duration::from_secs(3), async {
+        while !matches!(*states.borrow_and_update(), SessionState::Running) {
+            states.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let request = packet([198, 18, 0, 1], [198, 18, 0, 2]);
+    client_tx.send(request.clone()).unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(3), server_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        request
+    );
+    let response = packet([198, 18, 0, 2], [198, 18, 0, 1]);
+    server_tx.send(response.clone()).unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(3), client_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        response
+    );
+    assert_eq!(tunnel.stats().tx_bytes, 28);
+    assert_eq!(tunnel.stats().rx_bytes, 28);
+    tunnel.stop().await.unwrap();
+    assert_eq!(client_drops.load(Ordering::SeqCst), 2);
+    assert!(matches!(*states.borrow(), SessionState::Closed));
+    fixture.stop().await;
+    assert_eq!(server_drops.load(Ordering::SeqCst), 2);
+    client.stop().await.unwrap();
+}
+
+#[test]
+fn credentials_are_redacted_and_validation_does_not_read_environment() {
+    assert_eq!(
+        format!("{:?}", Credential::bearer(TOKEN).unwrap()),
+        "Credential([REDACTED])"
+    );
+    assert!(Credential::bearer("too-short").is_err());
+}
+
+#[tokio::test]
+async fn embedded_tcp_half_close_stats_probe_and_cancellation() {
+    tcp_acceptance(TlsProfile::Rustls).await;
+}
+
+async fn slow_reader_backpressure(tls_profile: TlsProfile) {
+    // More payload than either receive window and the local socket buffers.
+    // Keep only one chunk in the producer; holding a reader must stall its
+    // writer, and resuming it must preserve all bytes and independent FINs.
+    const CHUNK: usize = 64 * 1024;
+    const CHUNKS: usize = 2048;
+    let fixture = Fixture::new(None).await;
+    let client = fixture.client(tls_profile).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut flow = client
+        .open_tcp(&listener.local_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    let (mut upstream, _) = listener.accept().await.unwrap();
+    let mut producer = tokio::spawn(async move {
+        let payload = [42; CHUNK];
+        for _ in 0..CHUNKS {
+            flow.write_all(&payload).await.unwrap();
+        }
+        flow.shutdown().await.unwrap();
+        flow
+    });
+    assert!(
+        timeout(Duration::from_millis(150), &mut producer)
+            .await
+            .is_err()
+    );
+    let mut responder = tokio::spawn(async move {
+        let mut count = 0;
+        let mut chunk = [0; CHUNK];
+        loop {
+            let n = upstream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            assert!(chunk[..n].iter().all(|&b| b == 42));
+            count += n;
+        }
+        assert_eq!(count, CHUNKS * CHUNK);
+        for _ in 0..CHUNKS {
+            upstream.write_all(&[17; CHUNK]).await.unwrap();
+        }
+        upstream.shutdown().await.unwrap();
+    });
+    let mut flow = timeout(Duration::from_secs(10), producer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(150), &mut responder)
+            .await
+            .is_err()
+    );
+    timeout(Duration::from_secs(10), async {
+        let mut count = 0;
+        let mut chunk = [0; CHUNK];
+        loop {
+            let n = flow.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            assert!(chunk[..n].iter().all(|&b| b == 17));
+            count += n;
+        }
+        assert_eq!(count, CHUNKS * CHUNK);
+        responder.await.unwrap();
+    })
+    .await
+    .unwrap();
+    drop(flow);
+    client.stop().await.unwrap();
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn rustls_slow_readers_preserve_bidirectional_backpressure() {
+    slow_reader_backpressure(TlsProfile::Rustls).await;
+}
+
+#[cfg(feature = "chrome-tls")]
+#[tokio::test]
+async fn chrome_slow_readers_preserve_bidirectional_backpressure() {
+    slow_reader_backpressure(TlsProfile::Chrome154Linux).await;
+}
+#[tokio::test]
+async fn embedded_vpn_uses_packet_io_and_releases_owned_endpoints() {
+    vpn_acceptance(TlsProfile::Rustls).await;
+}
+#[cfg(feature = "chrome-tls")]
+#[tokio::test]
+async fn chrome_tcp_library_api() {
+    tcp_acceptance(TlsProfile::Chrome154Linux).await;
+}
+#[cfg(feature = "chrome-tls")]
+#[tokio::test]
+async fn chrome_vpn_library_api() {
+    vpn_acceptance(TlsProfile::Chrome154Linux).await;
+}

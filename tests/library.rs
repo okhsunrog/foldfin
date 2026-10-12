@@ -476,3 +476,83 @@ async fn session_retains_packet_device_across_loss_failed_recovery_and_new_carri
     assert_eq!(drops.load(Ordering::SeqCst), 2);
     assert_eq!(session.snapshot(), Event::Closed);
 }
+
+#[tokio::test]
+async fn shared_router_isolates_peers_and_keeps_one_device_owner() {
+    use foldfin::{admission::PeerId, router::Router};
+    use std::future::poll_fn;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (device, kernel_tx, mut kernel_rx) = device(drops.clone());
+    let mut router = Router::start(device);
+    let first_factory = router
+        .peer(
+            PeerId::new("first").unwrap(),
+            config("198.18.0.2", "198.18.0.1"),
+        )
+        .unwrap();
+    let mut first = first_factory.open().unwrap();
+    let second_factory = router
+        .peer(
+            PeerId::new("second").unwrap(),
+            config("198.18.0.2", "198.18.0.3"),
+        )
+        .unwrap();
+    let mut second = second_factory.open().unwrap();
+    let one = packet([198, 18, 0, 1], [198, 18, 0, 2]);
+    let two = packet([198, 18, 0, 3], [198, 18, 0, 2]);
+    poll_fn(|cx| first.send.poll_send(cx, &one)).await.unwrap();
+    poll_fn(|cx| second.send.poll_send(cx, &two)).await.unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        seen.push(
+            timeout(Duration::from_secs(2), kernel_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert!(seen.contains(&one) && seen.contains(&two));
+    assert!(poll_fn(|cx| first.send.poll_send(cx, &two)).await.is_err());
+    assert_eq!(router.stats().rejected_packets, 1);
+    assert!(
+        router
+            .peer(
+                PeerId::new("overlap").unwrap(),
+                config("198.18.0.2", "198.18.0.1")
+            )
+            .unwrap()
+            .open()
+            .is_err()
+    );
+    // Preparing and discarding a candidate does not alter active routes.
+    drop(first_factory.open().unwrap());
+    let reply_one = packet([198, 18, 0, 2], [198, 18, 0, 1]);
+    let reply_two = packet([198, 18, 0, 2], [198, 18, 0, 3]);
+    kernel_tx.send(reply_one.clone()).unwrap();
+    kernel_tx.send(reply_two.clone()).unwrap();
+    for (device, expected) in [(&mut first, &reply_one), (&mut second, &reply_two)] {
+        let mut buffer = [0; 1500];
+        let n = timeout(
+            Duration::from_secs(2),
+            poll_fn(|cx| device.recv.poll_recv(cx, &mut buffer)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buffer[..n], expected);
+    }
+    let mut replacement = first_factory.open().unwrap();
+    poll_fn(|cx| replacement.send.poll_send(cx, &one))
+        .await
+        .unwrap();
+    assert!(poll_fn(|cx| first.send.poll_send(cx, &one)).await.is_err());
+    drop(first);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    router.stop().await.unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    assert!(
+        poll_fn(|cx| replacement.send.poll_send(cx, &one))
+            .await
+            .is_err()
+    );
+}

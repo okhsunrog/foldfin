@@ -66,7 +66,7 @@ impl Config {
     }
 
     #[cfg(any(feature = "client", feature = "server", test))]
-    fn incoming(&self, source: IpAddr, dest: IpAddr) -> bool {
+    pub(crate) fn incoming(&self, source: IpAddr, dest: IpAddr) -> bool {
         allowed_ip(source)
             && allowed_ip(dest)
             && (self.peer.contains(&source) || self.peer_routes.iter().any(|p| p.contains(&source)))
@@ -208,7 +208,7 @@ impl Decoder {
 
 /// Validate full IP lengths and extract source/destination. No userspace TCP stack.
 #[cfg(any(feature = "client", feature = "server", test))]
-fn addresses(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
+pub(crate) fn addresses(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
     if packet.len() > MTU {
         return None;
     }

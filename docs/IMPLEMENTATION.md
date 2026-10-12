@@ -66,3 +66,9 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   revoked and stale candidates preserve the active generation; failed factory
   preparation is covered by a Floppa forwarding regression.
 - No Android ADB device is currently connected; physical acceptance is pending.
+- Shared `router::Router` owns one packet device. Peer factories reserve disjoint
+  source prefixes before admission and activate routes only when the admitted
+  bridge starts polling. Per-peer queues are byte-bounded (1 MiB/direction),
+  incoming scheduling is round-robin, and full outbound queues drop independently.
+  Tests cover peer isolation, spoof rejection, overlap rejection, inert candidates,
+  replacement and joined release of the shared device.

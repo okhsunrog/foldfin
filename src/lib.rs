@@ -29,6 +29,8 @@ pub mod packet;
 #[cfg(feature = "server")]
 mod request;
 #[cfg(feature = "server")]
+pub mod router;
+#[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "client")]
 pub mod session;

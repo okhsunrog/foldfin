@@ -316,6 +316,7 @@ async fn collect_packets(
     queued: tokio::sync::mpsc::Sender<Vec<Bytes>>,
 ) -> Result<()> {
     let mut buf = vec![0; 65536]; // large enough to detect an oversized TUN packet
+    let mut work = 0;
     loop {
         let mut n = poll_fn(|cx| recv.poll_recv(cx, &mut buf)).await?;
         let mut batch = Vec::with_capacity(32);
@@ -325,6 +326,11 @@ async fn collect_packets(
         // can exhaust h2's small-frame budget before the reader is polled.
         for index in 0..32 {
             ensure!(n != 0, "TUN closed");
+            work += 1;
+            if work == 32 {
+                tokio::task::yield_now().await;
+                work = 0;
+            }
             if let Some((source, destination)) = addresses(&buf[..n])
                 && config.incoming(destination, source)
             {
@@ -542,6 +548,36 @@ mod queue_tests {
     }
 
     struct Source(Arc<AtomicUsize>);
+
+    #[tokio::test]
+    async fn rejected_packets_yield_to_cancellation() {
+        struct Rejected(usize);
+        impl crate::packet::PacketRecv for Rejected {
+            fn poll_recv(
+                &mut self,
+                _: &mut Context<'_>,
+                buffer: &mut [u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.0 += 1;
+                assert!(self.0 <= 32, "collector did not yield");
+                buffer[..20].fill(0);
+                buffer[0] = 0x45;
+                buffer[3] = 20;
+                Poll::Ready(Ok(20))
+            }
+        }
+        let mut source = Rejected(0);
+        let (queued, _receiver) = tokio::sync::mpsc::channel(1);
+        let config = config();
+        let mut task = Box::pin(collect_packets(&mut source, &config, queued));
+        poll_fn(|cx| {
+            assert!(task.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(task);
+        assert_eq!(source.0, 32);
+    }
     impl crate::packet::PacketRecv for Source {
         fn poll_recv(
             &mut self,

@@ -5,6 +5,9 @@ use bytes::Bytes;
 use ipnet::IpNet;
 use std::net::IpAddr;
 
+const MAX_REQUESTS: usize = 60;
+const MAX_ASSIGNMENTS: usize = MAX_REQUESTS + 2;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Assignment {
     pub id: u64,
@@ -62,7 +65,12 @@ pub fn decode(
         1 | 2 => {
             let mut assignments = Vec::new();
             while !body.is_empty() {
-                ensure!(assignments.len() < 64, "too many capsule addresses");
+                let limit = if kind == 2 {
+                    MAX_REQUESTS
+                } else {
+                    MAX_ASSIGNMENTS
+                };
+                ensure!(assignments.len() < limit, "too many capsule addresses");
                 let (id, size) = varint(body).context("truncated request ID")?;
                 body = &body[size..];
                 ensure!(kind != 2 || id != 0, "zero ADDRESS_REQUEST ID");
@@ -227,7 +235,7 @@ impl State {
     /// Register outgoing IDs before sending. This does not dynamically reconfigure host addresses.
     pub fn request(&mut self, entries: &[Assignment]) -> Result<Bytes> {
         ensure!(
-            !entries.is_empty() && entries.len() <= 60,
+            !entries.is_empty() && entries.len() <= MAX_REQUESTS,
             "invalid request count"
         );
         ensure!(
@@ -494,6 +502,54 @@ mod tests {
 #[cfg(test)]
 mod request_tests {
     use super::*;
+    #[test]
+    fn maximal_request_response_fits_decoder() {
+        let config = Config {
+            local: vec!["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()],
+            peer: vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()],
+            local_routes: vec![],
+            peer_routes: vec![],
+        };
+        let entries: Vec<_> = (1..=MAX_REQUESTS as u64)
+            .map(|id| Assignment {
+                id,
+                prefix: "198.51.100.1/32".parse().unwrap(),
+            })
+            .collect();
+        let request = State::new().request(&entries).unwrap();
+        let mut server = State::new();
+        let mut response = None;
+        super::super::Decoder::default()
+            .feed_events(&request, |event| {
+                response = server.apply(event, &config)?;
+                Ok(())
+            })
+            .unwrap();
+        let mut count = 0;
+        super::super::Decoder::default()
+            .feed_events(&response.unwrap(), |event| {
+                if let Event::Assign(entries) = event {
+                    count = entries.len();
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, MAX_ASSIGNMENTS);
+        let excessive = encode_assignments(
+            2,
+            &(1..=64)
+                .map(|id| Assignment {
+                    id,
+                    prefix: "0.0.0.0/32".parse().unwrap(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            super::super::Decoder::default()
+                .feed_events(&excessive, |_| Ok(()))
+                .is_err()
+        );
+    }
     #[test]
     fn request_reply_cycle_denial_and_replay_are_checked() {
         let client_config = Config {

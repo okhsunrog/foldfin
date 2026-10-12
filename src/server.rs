@@ -41,6 +41,7 @@ struct Inner {
     flows: Arc<Semaphore>,
     counters: Arc<Counters>,
     receive_budget: crate::h2_window::ReceiveBudget,
+    sessions: crate::admission::Registry,
 }
 
 #[derive(Clone)]
@@ -62,6 +63,7 @@ impl Server {
         let authorizer = StaticAuthorizer {
             credential: config.credential,
             grant: AccessGrant {
+                peer: None,
                 proxy: true,
                 allow_private: config.allow_private,
                 vpn: config.vpn,
@@ -91,6 +93,7 @@ impl Server {
             flows: Arc::new(Semaphore::new(256)),
             counters: Arc::new(Counters::default()),
             receive_budget: crate::h2_window::ReceiveBudget::new(),
+            sessions: crate::admission::Registry::default(),
         })))
     }
 
@@ -194,6 +197,7 @@ impl Server {
                     response,
                     inner.authorizer.clone(),
                     inner.counters.clone(),
+                    inner.sessions.clone(),
                 )
                 .await
                 {
@@ -212,6 +216,7 @@ async fn serve_authorized(
     mut reply: h2::server::SendResponse<Bytes>,
     authorizer: Arc<dyn Authorizer>,
     counters: Arc<crate::stats::Counters>,
+    sessions: crate::admission::Registry,
 ) -> Result<()> {
     let protocol = req
         .extensions()
@@ -238,7 +243,7 @@ async fn serve_authorized(
     } else {
         None
     };
-    let Some(mut grant) = grant.filter(AccessGrant::valid) else {
+    let Some(grant) = grant.filter(AccessGrant::valid) else {
         let body = Bytes::from_static(b"<!doctype html><title>Welcome</title><h1>Welcome</h1>");
         let mut stream = reply.send_response(
             Response::builder()
@@ -253,34 +258,37 @@ async fn serve_authorized(
     if let Some(vpn) = &grant.vpn {
         vpn.policy.validate()?;
     }
-    let private = grant.allow_private;
-    let vpn = grant.vpn.clone();
-    let vpn_slots = grant.vpn_slots.clone();
-    let proxy = grant.proxy;
-    tokio::select! {
-        biased;
-        _ = grant.cancelled() => Ok(()),
-        result = serve_granted(req, reply, private, proxy, vpn, counters, vpn_slots) => result,
+    // A disconnected request cannot replace the live session during authorization.
+    if std::future::poll_fn(|cx| std::task::Poll::Ready(reply.poll_reset(cx).is_ready())).await {
+        return Ok(());
     }
+    serve_granted(req, reply, grant, counters, sessions).await
 }
 
 async fn serve_granted(
     req: Request<h2::RecvStream>,
     mut reply: h2::server::SendResponse<Bytes>,
-    private: bool,
-    proxy: bool,
-    vpn: Option<VpnConfig>,
+    mut grant: AccessGrant,
     counters: Arc<crate::stats::Counters>,
-    vpn_slot: Arc<Semaphore>,
+    sessions: crate::admission::Registry,
 ) -> Result<()> {
     if req.extensions().get::<h2::ext::Protocol>().is_some() {
-        let Some(config) = vpn else {
+        let Some(config) = grant.vpn.clone() else {
             reply.send_response(Response::builder().status(501).body(())?, true)?;
             return Ok(());
         };
-        let Ok(_slot) = vpn_slot.try_acquire_owned() else {
-            reply.send_response(Response::builder().status(409).body(())?, true)?;
-            return Ok(());
+        let admission = grant.peer.clone().map(|peer| sessions.prepare(peer));
+        // Anonymous/static peers cannot replace an existing owner.
+        let mut slot = if admission.is_none() {
+            match grant.vpn_slots.clone().try_acquire_owned() {
+                Ok(slot) => Some(slot),
+                Err(_) => {
+                    reply.send_response(Response::builder().status(409).body(())?, true)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
         };
         let tun = match config.device.open() {
             Ok(tun) => tun,
@@ -289,6 +297,35 @@ async fn serve_granted(
                 return Err(error.into());
             }
         };
+        if !grant.valid()
+            || std::future::poll_fn(|cx| std::task::Poll::Ready(reply.poll_reset(cx).is_ready()))
+                .await
+        {
+            return Ok(());
+        }
+        let owner = if let Some(admission) = admission {
+            match admission.commit(&grant) {
+                Ok(owner) => {
+                    grant.session = Some(owner.lease.clone());
+                    Some(owner)
+                }
+                Err(error) => {
+                    reply.send_response(Response::builder().status(409).body(())?, true)?;
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
+        if slot.is_none() {
+            let slots = grant.vpn_slots.clone();
+            slot = Some(tokio::select! {
+                biased;
+                _ = grant.cancelled() => return Ok(()),
+                slot = timeout(crate::DEADLINE, slots.acquire_owned()) => slot??,
+            });
+        }
+        let (_slot, _owner) = (slot, owner);
         let output = reply.send_response(
             Response::builder()
                 .status(200)
@@ -296,10 +333,13 @@ async fn serve_granted(
                 .body(())?,
             false,
         )?;
-        return crate::vpn::bridge(tun, &config.policy, req.into_body(), output, counters, None)
-            .await;
+        return tokio::select! {
+            biased;
+            _ = grant.cancelled() => Ok(()),
+            result = crate::vpn::bridge(tun, &config.policy, req.into_body(), output, counters, None) => result,
+        };
     }
-    if !proxy {
+    if !grant.proxy {
         reply.send_response(Response::builder().status(403).body(())?, true)?;
         return Ok(());
     }
@@ -307,7 +347,13 @@ async fn serve_granted(
         reply.send_response(Response::builder().status(400).body(())?, true)?;
         return Ok(());
     };
-    let tcp = match crate::connect_target(authority.as_str(), private).await {
+    let private = grant.allow_private;
+    let connected = tokio::select! {
+        biased;
+        _ = grant.cancelled() => return Ok(()),
+        result = crate::connect_target(authority.as_str(), private) => result,
+    };
+    let tcp = match connected {
         Ok(tcp) => tcp,
         Err(_) => {
             reply.send_response(Response::builder().status(502).body(())?, true)?;
@@ -315,7 +361,11 @@ async fn serve_granted(
         }
     };
     let output = reply.send_response(Response::builder().status(200).body(())?, false)?;
-    crate::bridge(tcp, req.into_body(), output).await
+    tokio::select! {
+        biased;
+        _ = grant.cancelled() => Ok(()),
+        result = crate::bridge(tcp, req.into_body(), output) => result,
+    }
 }
 
 #[cfg(test)]
@@ -347,7 +397,13 @@ mod admission_tests {
             builder.enable_connect_protocol();
             let mut conn = builder.handshake(server).await.unwrap();
             let (request, response) = conn.accept().await.unwrap().unwrap();
-            let serve = serve_authorized(request, response, access, Arc::new(Counters::default()));
+            let serve = serve_authorized(
+                request,
+                response,
+                access,
+                Arc::new(Counters::default()),
+                crate::admission::Registry::default(),
+            );
             tokio::pin!(serve);
             tokio::select! {
                 result = &mut serve => result.unwrap(),

@@ -9,6 +9,8 @@ use bytes::Bytes;
 use h2::{RecvStream, SendStream};
 pub mod adapters;
 #[cfg(feature = "server")]
+pub mod admission;
+#[cfg(feature = "server")]
 pub mod authorization;
 #[cfg(feature = "cli")]
 pub mod cli;

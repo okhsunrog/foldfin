@@ -56,3 +56,13 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
 - Floppa network-change handling now replaces the carrier through that session;
   a manager-level test verifies device ownership remains stable and forwarding
   resumes. Actor-wide retry states and session-scoped Android Underlay remain open.
+- Floppa config v2 has a cached dual-stack NetworkPlan and explicit route exclusions.
+  Android uses its provisioned routes; desktop rolls back every configured address.
+  v1 imports explicitly require reissuance. 236 Floppa core unit tests and four
+  integration tests pass. H3-only currently reports unavailable; Auto uses H2
+  until the H3 VPN bridge and candidate selection are connected.
+- Server-owned generation admission replaces authorizer-side revocation. Packet
+  device preparation and request cancellation checks precede commit. Aborted,
+  revoked and stale candidates preserve the active generation; failed factory
+  preparation is covered by a Floppa forwarding regression.
+- No Android ADB device is currently connected; physical acceptance is pending.

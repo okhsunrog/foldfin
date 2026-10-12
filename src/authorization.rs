@@ -82,6 +82,8 @@ impl AccessLease {
 
 #[derive(Clone)]
 pub struct AccessGrant {
+    /// Stable identity supplied by the host. Session replacement belongs to the server.
+    pub peer: Option<crate::admission::PeerId>,
     pub proxy: bool,
     pub allow_private: bool,
     pub vpn: Option<VpnConfig>,

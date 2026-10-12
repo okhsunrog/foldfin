@@ -36,6 +36,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(vpn: Option<VpnConfig>) -> Self {
+        Self::new_with_transport(vpn, false).await
+    }
+
+    async fn new_with_transport(vpn: Option<VpnConfig>, h3: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("key.pem");
         let cert = dir.path().join("cert.pem");
@@ -85,6 +89,16 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
+            #[cfg(feature = "h3")]
+            if h3 {
+                let socket = std::net::UdpSocket::bind(address).unwrap();
+                return server
+                    .serve_h3(socket, async {
+                        let _ = stopped.await;
+                    })
+                    .await;
+            }
+            assert!(!h3);
             server
                 .serve(listener, async {
                     let _ = stopped.await;
@@ -428,14 +442,36 @@ async fn session_retains_packet_device_across_loss_failed_recovery_and_new_carri
     let (packet_device, tx, _rx) = device(drops.clone());
     let mut session = Session::new(config("198.18.0.1", "198.18.0.2"), packet_device).unwrap();
     let mut events = session.subscribe();
-    for _ in 0..2 {
+    for attempt in 0..3 {
         let (packet_device, _tx, mut received) = device(Arc::new(AtomicUsize::new(0)));
-        let fixture = Fixture::new(Some(VpnConfig {
-            policy: config("198.18.0.2", "198.18.0.1"),
-            device: Arc::new(Factory(Mutex::new(Some(packet_device)))),
-        }))
+        let fixture = Fixture::new_with_transport(
+            Some(VpnConfig {
+                policy: config("198.18.0.2", "198.18.0.1"),
+                device: Arc::new(Factory(Mutex::new(Some(packet_device)))),
+            }),
+            cfg!(feature = "h3") && attempt == 1,
+        )
         .await;
-        let client = fixture.client().await;
+        #[cfg(feature = "h3")]
+        let client: foldfin::session::Carrier = if attempt == 1 {
+            foldfin::h3_client::Client::connect_over(
+                ClientConfig {
+                    authority: "localhost:8443".into(),
+                    server_name: "localhost".into(),
+                    credential: Credential::bearer(TOKEN).unwrap(),
+                    additional_ca_pem: Some(fixture.certificate.clone()),
+                },
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                fixture.address,
+            )
+            .await
+            .unwrap()
+            .into()
+        } else {
+            fixture.client().await.into()
+        };
+        #[cfg(not(feature = "h3"))]
+        let client: foldfin::session::Carrier = fixture.client().await.into();
         session.recover(client.clone()).await.unwrap();
         timeout(Duration::from_secs(3), async {
             while !matches!(*events.borrow_and_update(), Event::Running) {
@@ -470,7 +506,7 @@ async fn session_retains_packet_device_across_loss_failed_recovery_and_new_carri
         assert!(matches!(session.snapshot(), Event::CarrierLost { .. }));
         rejected.stop().await;
     }
-    assert_eq!(session.stats().tx_bytes, 56);
+    assert_eq!(session.stats().tx_bytes, 84);
     session.stop().await.unwrap();
     session.stop().await.unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 2);
@@ -555,4 +591,123 @@ async fn shared_router_isolates_peers_and_keeps_one_device_owner() {
             .await
             .is_err()
     );
+}
+
+#[cfg(feature = "h3")]
+#[tokio::test]
+async fn h3_vpn_carries_full_mtu_datagrams_and_reliable_configuration() {
+    let server_drops = Arc::new(AtomicUsize::new(0));
+    let (server_device, server_tx, mut server_rx) = device(server_drops.clone());
+    let fixture = Fixture::new_with_transport(
+        Some(VpnConfig {
+            policy: config("198.18.0.2", "198.18.0.1"),
+            device: Arc::new(Factory(Mutex::new(Some(server_device)))),
+        }),
+        true,
+    )
+    .await;
+    let client = foldfin::h3_client::Client::connect_over(
+        ClientConfig {
+            authority: "localhost:8443".into(),
+            server_name: "localhost".into(),
+            credential: Credential::bearer(TOKEN).unwrap(),
+            additional_ca_pem: Some(fixture.certificate.clone()),
+        },
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        fixture.address,
+    )
+    .await
+    .unwrap();
+    client.probe().await.unwrap();
+    let prepared = client
+        .prepare_vpn(config("198.18.0.1", "198.18.0.2"))
+        .await
+        .unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (device, tx, mut rx) = device(drops.clone());
+    let tunnel = prepared.start(device);
+    let mut state = tunnel.subscribe();
+    timeout(Duration::from_secs(3), async {
+        while !matches!(*state.borrow_and_update(), SessionState::Running) {
+            state.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let mut request = packet([198, 18, 0, 1], [198, 18, 0, 2]);
+    request.resize(1280, 0x5a);
+    request[2..4].copy_from_slice(&1280_u16.to_be_bytes());
+    tx.send(request.clone()).unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(3), server_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        request
+    );
+    let response = packet([198, 18, 0, 2], [198, 18, 0, 1]);
+    server_tx.send(response.clone()).unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        response
+    );
+    tunnel.stop().await.unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    client.stop().await.unwrap();
+    fixture.stop().await;
+    assert_eq!(server_drops.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(feature = "h3")]
+#[tokio::test]
+async fn h3_accepts_early_datagram_capsules_without_losing_buffered_data() {
+    use bytes::Bytes;
+    let (packet_device, _tx, mut received) = device(Arc::new(AtomicUsize::new(0)));
+    let fixture = Fixture::new_with_transport(
+        Some(VpnConfig {
+            policy: config("198.18.0.2", "198.18.0.1"),
+            device: Arc::new(Factory(Mutex::new(Some(packet_device)))),
+        }),
+        true,
+    )
+    .await;
+    let mut client = foldfin::h3_transport::Client::connect(
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        fixture.address,
+        "localhost",
+        Some(&fixture.certificate),
+    )
+    .await
+    .unwrap();
+    let mut stream = client
+        .request(
+            http::Request::builder()
+                .method("CONNECT")
+                .uri(format!("https://localhost{}", foldfin::vpn::PATH))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("capsule-protocol", "?1")
+                .body(())
+                .unwrap(),
+            Some(foldfin::h3_transport::ConnectProtocol::Ip),
+        )
+        .await
+        .unwrap();
+    let packet = packet([198, 18, 0, 1], [198, 18, 0, 2]);
+    let mut capsule = vec![0, (packet.len() + 1) as u8, 0];
+    capsule.extend_from_slice(&packet);
+    stream.send(Bytes::from(capsule)).await.unwrap();
+    assert_eq!(stream.response().await.unwrap().status(), 200);
+    assert_eq!(
+        timeout(Duration::from_secs(3), received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        packet
+    );
+    drop(stream);
+    client.stop().await;
+    fixture.stop().await;
 }

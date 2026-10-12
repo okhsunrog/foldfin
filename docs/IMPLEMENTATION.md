@@ -9,7 +9,7 @@ Android owns its system lockdown policy. No protocol-owned kill switch.
 
 - [x] Record original source (364a0c5) and release binary baseline.
 - [x] Fix packet collector fairness and capsule request/response bounds.
-- [ ] H3 vertical slice with caller-owned UDP sockets and TLS validation.
+- [x] H3 vertical slice with caller-owned UDP sockets and TLS validation.
 - [ ] Transport-independent sessions, bounded queues, recovery and multi-peer router.
 - [x] Remove Chrome backend; update CLI and regression harnesses.
 - [ ] Floppa config v2, dual-stack NetworkPlan, Underlay, Recovering and typed health.
@@ -39,7 +39,10 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   extended CONNECT, reliable streams, HTTP datagrams, path payload checks and
   joined shutdown. Local tests cover four independent streams, half-close,
   nonzero quarter-stream IDs and negative certificate/name validation.
-  This is a carrier API, not yet the integrated CONNECT-IP VPN bridge.
+  CONNECT-IP now uses this carrier with reliable configuration and HTTP datagrams,
+  requiring capacity for a 1280-byte inner IP packet. Incoming capsules and QUIC
+  datagrams share byte-bounded, age-limited delivery; reliable control responses
+  are bounded. The server shares authorization, admission and global limits with H2.
 - CONNECT syntax is validated before application authorization, with an H2
   regression proving invalid requests never call the authorizer.
 - Published h3 0.0.8 lacks CONNECT-IP and h3-datagram 0.0.2 discards the encoded
@@ -49,7 +52,7 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   switches removed. Floppa's importing adapter updated to the rustls-only client
   API. Existing measurements remain historical. H2 proxy and Floppa's three
   integration tests pass after the removal.
-- H2 `session::Session` retains the packet device across carrier failure,
+- `session::Session` retains the packet device across carrier failure,
   failed negotiation and explicit recovery. Recovery is host-driven and one
   attempt at a time; stop joins tasks before releasing the device. Integration
   tests verify packet transfer over two carriers and no premature device drop.
@@ -72,3 +75,10 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   incoming scheduling is round-robin, and full outbound queues drop independently.
   Tests cover peer isolation, spoof rejection, overlap rejection, inert candidates,
   replacement and joined release of the shared device.
+
+- Local regressions cover H2 -> H3 -> H2 with one packet device, full-MTU H3
+  packet transfer, early DATAGRAM capsules, queue byte/age limits and budget release.
+  Floppa manager regressions cover H3 recovery/replacement/revocation and Auto
+  fallback with bound but unresponsive UDP. H3 is still optional; CLI transport
+  selection and CONNECT-UDP are not yet implemented. The 100 ms age policy covers
+  the application receive queue; expiry inside Quinn's outbound queue is still open.

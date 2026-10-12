@@ -1,7 +1,7 @@
 //! A VPN session owns its packet device across carrier loss and explicit recovery.
 //! The host supplies each connected carrier and decides when/how to retry.
 use crate::{
-    client::{Client, VpnTunnel},
+    client::{Client as H2Client, VpnTunnel},
     error::{Error, Result},
     packet::{PacketDevice, PacketRecv, PacketSend},
     stats::{SessionState, TrafficStats},
@@ -24,12 +24,71 @@ pub enum Event {
     Closed,
 }
 
+/// A prepared carrier supplied by the host's transport/underlay policy.
+#[derive(Clone)]
+pub enum Carrier {
+    H2(H2Client),
+    #[cfg(feature = "h3")]
+    H3(crate::h3_client::Client),
+}
+impl From<H2Client> for Carrier {
+    fn from(client: H2Client) -> Self {
+        Self::H2(client)
+    }
+}
+#[cfg(feature = "h3")]
+impl From<crate::h3_client::Client> for Carrier {
+    fn from(client: crate::h3_client::Client) -> Self {
+        Self::H3(client)
+    }
+}
+enum Prepared {
+    H2(crate::client::PreparedVpn),
+    #[cfg(feature = "h3")]
+    H3(Box<crate::h3_client::PreparedVpn>),
+}
+impl Prepared {
+    fn start(self, device: PacketDevice) -> VpnTunnel {
+        match self {
+            Self::H2(p) => p.start(device),
+            #[cfg(feature = "h3")]
+            Self::H3(p) => p.start(device),
+        }
+    }
+}
+impl Carrier {
+    async fn prepare_vpn(&self, config: vpn::Config) -> Result<Prepared> {
+        match self {
+            Self::H2(c) => c.prepare_vpn(config).await.map(Prepared::H2),
+            #[cfg(feature = "h3")]
+            Self::H3(c) => c
+                .prepare_vpn(config)
+                .await
+                .map(|p| Prepared::H3(Box::new(p))),
+        }
+    }
+    pub async fn stop(&self) -> Result<()> {
+        match self {
+            Self::H2(c) => c.clone().stop().await,
+            #[cfg(feature = "h3")]
+            Self::H3(c) => c.stop().await,
+        }
+    }
+    async fn probe(&self) -> Result<()> {
+        match self {
+            Self::H2(c) => c.probe().await,
+            #[cfg(feature = "h3")]
+            Self::H3(c) => c.probe().await,
+        }
+    }
+}
+
 /// One owner serializes recovery. Dropping a recovery future retains the device
 /// and candidate carrier so a later recovery/stop can finish their teardown.
 pub struct Session {
     device: Option<Arc<Mutex<PacketDevice>>>,
     config: vpn::Config,
-    client: Option<Client>,
+    client: Option<Carrier>,
     tunnel: Option<VpnTunnel>,
     monitor: Option<JoinHandle<()>>,
     events: watch::Sender<Event>,
@@ -71,7 +130,7 @@ impl Session {
     }
     /// One attempt using an already connected carrier; never silently redials or
     /// changes a healthy connection. Initial attachment uses this same method.
-    pub async fn recover(&mut self, client: Client) -> Result<()> {
+    pub async fn recover(&mut self, client: impl Into<Carrier>) -> Result<()> {
         if self.device.is_none() {
             return Err(Error::Closed);
         }
@@ -87,7 +146,7 @@ impl Session {
         }
         self.stop_carrier().await;
         self.events.send_replace(Event::Recovering);
-        self.client = Some(client);
+        self.client = Some(client.into());
         let result = self
             .client
             .as_ref()
@@ -165,7 +224,7 @@ impl Session {
             self.completed_rx += stats.rx_bytes;
         }
         if let Some(client) = &self.client {
-            let _ = client.clone().stop().await;
+            let _ = client.stop().await;
         }
         self.client.take();
     }

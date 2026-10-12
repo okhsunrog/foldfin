@@ -396,10 +396,10 @@ impl PreparedVpn {
 }
 
 pub struct VpnTunnel {
-    publish: watch::Sender<SessionState>,
-    task: Option<JoinHandle<Result<()>>>,
-    state: watch::Receiver<SessionState>,
-    counters: Arc<Counters>,
+    pub(crate) publish: watch::Sender<SessionState>,
+    pub(crate) task: Option<JoinHandle<Result<()>>>,
+    pub(crate) state: watch::Receiver<SessionState>,
+    pub(crate) counters: Arc<Counters>,
 }
 
 impl VpnTunnel {

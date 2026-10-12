@@ -674,3 +674,95 @@ mod queue_tests {
         assert_eq!(counters.snapshot().tx_bytes, p.len() as u64);
     }
 }
+
+/// H3 carries control capsules reliably and IP packets in HTTP datagrams.
+#[cfg(all(feature = "h3", any(feature = "client", feature = "server")))]
+pub(crate) async fn bridge_h3(
+    mut device: crate::packet::PacketDevice,
+    config: &Config,
+    stream: crate::h3_transport::Stream,
+    packets: (crate::h3_packets::Sender, crate::h3_packets::Receiver),
+    counters: std::sync::Arc<crate::stats::Counters>,
+    status: Option<tokio::sync::watch::Sender<crate::stats::SessionState>>,
+) -> Result<()> {
+    let (mut output, mut input) = stream.split();
+    let (sender, mut receiver) = packets;
+    sender.require_vpn_mtu().await?;
+    let assignments: Vec<_> = config
+        .peer
+        .iter()
+        .map(|ip| control::Assignment {
+            id: 0,
+            prefix: IpNet::from(*ip),
+        })
+        .collect();
+    output.send(control::assign(&assignments)).await?;
+    output.send(control::advertise(config)).await?;
+    let state = std::sync::Mutex::new(control::State::new());
+    let capsules = receiver.capsules();
+    let control = async {
+        let mut decoder = Decoder::default();
+        while let Some(data) = input.recv().await? {
+            let mut replies = Vec::new();
+            decoder.feed_events(&data, |event| {
+                // RFC 9297 gives capsules and QUIC datagrams identical receive
+                // semantics. Both enter the same bounded, age-limited queue.
+                if let control::Event::Packet(packet) = event {
+                    capsules.send(Bytes::copy_from_slice(packet));
+                } else {
+                    let mut state = state.lock().unwrap();
+                    if let Some(reply) = state.apply(event, config)? {
+                        ensure!(replies.len() < 16, "too many pending control replies");
+                        replies.push(reply);
+                    }
+                    if state.confirmed()
+                        && let Some(status) = &status
+                    {
+                        status.send_replace(crate::stats::SessionState::Running);
+                    }
+                }
+                Ok(())
+            })?;
+            for reply in replies {
+                output.send(reply).await?;
+            }
+            tokio::task::yield_now().await;
+        }
+        decoder.finish()?;
+        Err::<(), _>(anyhow::anyhow!("CONNECT-IP control stream closed"))
+    };
+    let upload = async {
+        let mut buffer = vec![0; 65536];
+        loop {
+            let length = poll_fn(|cx| device.recv.poll_recv(cx, &mut buffer)).await?;
+            ensure!(length != 0, "packet device closed");
+            if length <= 1280
+                && let Some((source, destination)) = addresses(&buffer[..length])
+                && config.incoming(destination, source)
+                && state.lock().unwrap().outbound(config, source, destination)
+            {
+                sender.send(Bytes::copy_from_slice(&buffer[..length]))?;
+                counters.tx(length);
+            }
+            tokio::task::yield_now().await;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    let download = async {
+        loop {
+            let packet = receiver.recv().await?;
+            if packet.len() <= 1280
+                && let Some((source, destination)) = addresses(&packet)
+                && config.incoming(source, destination)
+            {
+                poll_fn(|cx| device.send.poll_send(cx, &packet)).await?;
+                counters.rx(packet.len());
+            }
+            tokio::task::yield_now().await;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::select! { result = control => result, result = upload => result, result = download => result }
+}

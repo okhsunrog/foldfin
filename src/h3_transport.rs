@@ -121,7 +121,11 @@ impl PendingRequest {
             Some(p) if p == h3::ext::Protocol::CONNECT_UDP => Some(ConnectProtocol::Udp),
             Some(_) => return Err(Error::Unsupported("extended CONNECT protocol")),
         };
-        Ok((request, extension, Stream(StreamInner::Server(stream))))
+        Ok((
+            request,
+            extension,
+            Stream(StreamInner::Server(stream), None),
+        ))
     }
 }
 
@@ -183,6 +187,8 @@ impl Client {
             {
                 Error::Tls(error.into())
             }
+            quinn::ConnectionError::TimedOut => Error::Timeout("QUIC handshake"),
+            quinn::ConnectionError::Reset => Error::Io(std::io::ErrorKind::ConnectionReset.into()),
             _ => protocol(error),
         })?;
         let (mut driver, sender) = h3::client::builder()
@@ -232,13 +238,17 @@ impl Client {
             });
         }
         let stream = self.sender.send_request(request).await.map_err(protocol)?;
-        Ok(Stream(StreamInner::Client(stream)))
+        Ok(Stream(StreamInner::Client(stream), None))
     }
     pub async fn stop(mut self) {
+        self.stop_mut().await;
+    }
+    pub(crate) async fn stop_mut(&mut self) {
         self.endpoint.close(0x100_u32.into(), b"shutdown");
-        if let Some(driver) = self.driver.take() {
+        if let Some(driver) = self.driver.as_mut() {
             let _ = driver.await;
         }
+        self.driver.take();
         self.endpoint.wait_idle().await;
     }
 }
@@ -318,12 +328,37 @@ impl Datagrams {
     }
 }
 
-pub struct Stream(StreamInner);
+pub struct Stream(StreamInner, Option<Bytes>);
 enum StreamInner {
     Client(h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>),
     Server(h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>),
 }
 impl Stream {
+    /// Inspect already received cancellation before committing admission. Preserve
+    /// any early control data for the bridge; this never waits for peer input.
+    #[cfg(feature = "server")]
+    pub(crate) async fn check_open(&mut self) -> Result<()> {
+        if self.1.is_some() {
+            return Ok(());
+        }
+        let next = std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            match &mut self.0 {
+                StreamInner::Server(s) => Poll::Ready(match s.poll_recv_data(cx) {
+                    Poll::Pending => Ok(None),
+                    Poll::Ready(Ok(Some(mut data))) => {
+                        Ok(Some(data.copy_to_bytes(data.remaining())))
+                    }
+                    Poll::Ready(Ok(None)) => Err(Error::Closed),
+                    Poll::Ready(Err(error)) => Err(protocol(error)),
+                }),
+                _ => Poll::Ready(Err(Error::Unsupported("server admission on client stream"))),
+            }
+        })
+        .await?;
+        self.1 = next;
+        Ok(())
+    }
     pub fn id(&self) -> u64 {
         match &self.0 {
             StreamInner::Client(s) => s.id().into_inner(),
@@ -349,6 +384,9 @@ impl Stream {
         }
     }
     pub async fn recv(&mut self) -> Result<Option<Bytes>> {
+        if let Some(data) = self.1.take() {
+            return Ok(Some(data));
+        }
         match &mut self.0 {
             StreamInner::Client(s) => Ok(s
                 .recv_data()
@@ -366,6 +404,70 @@ impl Stream {
         match &mut self.0 {
             StreamInner::Client(s) => s.finish().await.map_err(protocol),
             StreamInner::Server(s) => s.finish().await.map_err(protocol),
+        }
+    }
+}
+
+pub struct SendStream(SendInner);
+enum SendInner {
+    Client(h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>),
+    Server(h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>),
+}
+pub struct RecvStream(RecvInner, Option<Bytes>);
+enum RecvInner {
+    Client(h3::client::RequestStream<h3_quinn::RecvStream, Bytes>),
+    Server(h3::server::RequestStream<h3_quinn::RecvStream, Bytes>),
+}
+impl Stream {
+    pub fn split(self) -> (SendStream, RecvStream) {
+        match self.0 {
+            StreamInner::Client(s) => {
+                let (tx, rx) = s.split();
+                (
+                    SendStream(SendInner::Client(tx)),
+                    RecvStream(RecvInner::Client(rx), self.1),
+                )
+            }
+            StreamInner::Server(s) => {
+                let (tx, rx) = s.split();
+                (
+                    SendStream(SendInner::Server(tx)),
+                    RecvStream(RecvInner::Server(rx), self.1),
+                )
+            }
+        }
+    }
+}
+impl SendStream {
+    pub async fn send(&mut self, data: Bytes) -> Result<()> {
+        match &mut self.0 {
+            SendInner::Client(s) => s.send_data(data).await.map_err(protocol),
+            SendInner::Server(s) => s.send_data(data).await.map_err(protocol),
+        }
+    }
+    pub async fn finish(&mut self) -> Result<()> {
+        match &mut self.0 {
+            SendInner::Client(s) => s.finish().await.map_err(protocol),
+            SendInner::Server(s) => s.finish().await.map_err(protocol),
+        }
+    }
+}
+impl RecvStream {
+    pub async fn recv(&mut self) -> Result<Option<Bytes>> {
+        if let Some(data) = self.1.take() {
+            return Ok(Some(data));
+        }
+        match &mut self.0 {
+            RecvInner::Client(s) => Ok(s
+                .recv_data()
+                .await
+                .map_err(protocol)?
+                .map(|mut b| b.copy_to_bytes(b.remaining()))),
+            RecvInner::Server(s) => Ok(s
+                .recv_data()
+                .await
+                .map_err(protocol)?
+                .map(|mut b| b.copy_to_bytes(b.remaining()))),
         }
     }
 }

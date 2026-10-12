@@ -42,6 +42,8 @@ struct Inner {
     counters: Arc<Counters>,
     receive_budget: crate::h2_window::ReceiveBudget,
     sessions: crate::admission::Registry,
+    #[cfg(feature = "h3")]
+    tls: Arc<rustls::ServerConfig>,
 }
 
 #[derive(Clone)]
@@ -87,7 +89,9 @@ impl Server {
             ));
         }
         Ok(Self(Arc::new(Inner {
-            acceptor: TlsAcceptor::from(tls),
+            acceptor: TlsAcceptor::from(tls.clone()),
+            #[cfg(feature = "h3")]
+            tls,
             authorizer,
             connections: Arc::new(Semaphore::new(128)),
             flows: Arc::new(Semaphore::new(256)),
@@ -365,6 +369,240 @@ async fn serve_granted(
         biased;
         _ = grant.cancelled() => Ok(()),
         result = crate::bridge(tcp, req.into_body(), output) => result,
+    }
+}
+
+#[cfg(feature = "h3")]
+impl Server {
+    /// Serve HTTP/3 on a host-prepared UDP socket, sharing authorization, session
+    /// generations and global connection/flow limits with this server's H2 listener.
+    pub async fn serve_h3(
+        &self,
+        socket: std::net::UdpSocket,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> crate::error::Result<()> {
+        let listener = crate::h3_transport::Listener::new(socket, (*self.0.tls).clone())?;
+        let (cancel, stopped) = watch::channel(false);
+        let mut peers = JoinSet::new();
+        tokio::pin!(shutdown);
+        let result = loop {
+            tokio::select! {
+                _ = &mut shutdown => break Ok(()),
+                _ = peers.join_next(), if !peers.is_empty() => (),
+                incoming = listener.accept() => {
+                    let incoming = match incoming { Ok(Some(incoming)) => incoming, Ok(None) => break Ok(()), Err(error) => break Err(error) };
+                    let Ok(permit) = self.0.connections.clone().try_acquire_owned() else { continue; };
+                    let server = self.clone();
+                    let stopped = stopped.clone();
+                    peers.spawn(async move { let _permit = permit; server.serve_h3_peer(incoming, stopped).await });
+                }
+            }
+        };
+        cancel.send_replace(true);
+        while peers.join_next().await.is_some() {}
+        listener.stop().await;
+        result
+    }
+    async fn serve_h3_peer(
+        &self,
+        incoming: crate::h3_transport::Incoming,
+        mut stopped: watch::Receiver<bool>,
+    ) -> crate::error::Result<()> {
+        let mut connection = tokio::select! {
+            _ = stopped.changed() => return Ok(()),
+            connection = incoming.handshake() => connection?,
+        };
+        let packets = Arc::new(tokio::sync::Mutex::new(crate::h3_packets::Hub::new(
+            connection.datagrams(),
+        )));
+        let mut tasks = JoinSet::new();
+        let result = loop {
+            tokio::select! {
+                _ = stopped.changed() => break Ok(()),
+                _ = tasks.join_next(), if !tasks.is_empty() => (),
+                request = connection.accept() => {
+                    let request = match request { Ok(Some(request)) => request, Ok(None) => break Ok(()), Err(error) => break Err(error) };
+                    let Ok(permit) = self.0.flows.clone().try_acquire_owned() else { continue; };
+                    let server = self.clone();
+                    let packets = packets.clone();
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = server.serve_h3_request(request, packets).await { tracing::debug!(%error, "H3 stream failed"); }
+                    });
+                }
+            }
+        };
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        packets.lock().await.stop().await;
+        result
+    }
+    async fn serve_h3_request(
+        &self,
+        pending: crate::h3_transport::PendingRequest,
+        packets: Arc<tokio::sync::Mutex<crate::h3_packets::Hub>>,
+    ) -> Result<()> {
+        use crate::h3_transport::ConnectProtocol;
+        let (request, extension, mut stream) = pending.resolve().await?;
+        let protocol = extension.map(|p| match p {
+            ConnectProtocol::Ip => "connect-ip",
+            ConnectProtocol::Udp => "connect-udp",
+        });
+        let Some(mode) = crate::request::validate(&request, protocol) else {
+            stream
+                .respond(
+                    Response::builder()
+                        .status(if request.method() == http::Method::CONNECT {
+                            400
+                        } else {
+                            404
+                        })
+                        .body(())?,
+                )
+                .await?;
+            stream.finish().await?;
+            return Ok(());
+        };
+        let grant = if let Some(header) = request.headers().get("authorization") {
+            timeout(
+                crate::DEADLINE,
+                self.0
+                    .authorizer
+                    .authorize(AccessRequest::new(mode, header.clone())),
+            )
+            .await??
+        } else {
+            None
+        };
+        let Some(mut grant) = grant.filter(AccessGrant::valid) else {
+            stream
+                .respond(Response::builder().status(403).body(())?)
+                .await?;
+            stream.finish().await?;
+            return Ok(());
+        };
+        if extension == Some(ConnectProtocol::Ip) {
+            let Some(config) = grant.vpn.clone() else {
+                stream
+                    .respond(Response::builder().status(501).body(())?)
+                    .await?;
+                stream.finish().await?;
+                return Ok(());
+            };
+            config.policy.validate()?;
+            let channel = packets.lock().await.subscribe(stream.id())?;
+            // Path capability failure precedes admission, so H2 fallback cannot
+            // accidentally tear down a working VPN session.
+            if channel.0.require_vpn_mtu().await.is_err() {
+                stream
+                    .respond(Response::builder().status(501).body(())?)
+                    .await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+            let prepared = grant.peer.clone().map(|peer| self.0.sessions.prepare(peer));
+            let mut slot = if prepared.is_none() {
+                match grant.vpn_slots.clone().try_acquire_owned() {
+                    Ok(slot) => Some(slot),
+                    Err(_) => {
+                        stream
+                            .respond(Response::builder().status(409).body(())?)
+                            .await?;
+                        stream.finish().await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+            let device = match config.device.open() {
+                Ok(device) => device,
+                Err(error) => {
+                    stream
+                        .respond(Response::builder().status(503).body(())?)
+                        .await?;
+                    stream.finish().await?;
+                    return Err(error.into());
+                }
+            };
+            stream.check_open().await?;
+            let owner = match prepared {
+                Some(prepared) => {
+                    let owner = prepared.commit(&grant)?;
+                    grant.session = Some(owner.lease.clone());
+                    Some(owner)
+                }
+                None => None,
+            };
+            if slot.is_none() {
+                let slots = grant.vpn_slots.clone();
+                slot = Some(tokio::select! {
+                    biased;
+                    _ = grant.cancelled() => return Ok(()),
+                    slot = timeout(crate::DEADLINE, slots.acquire_owned()) => slot??,
+                });
+            }
+            let (_slot, _owner) = (slot, owner);
+            stream
+                .respond(
+                    Response::builder()
+                        .status(200)
+                        .header("capsule-protocol", "?1")
+                        .body(())?,
+                )
+                .await?;
+            return tokio::select! {
+                biased;
+                _ = grant.cancelled() => Ok(()),
+                result = crate::vpn::bridge_h3(device, &config.policy, stream, channel, self.0.counters.clone(), None) => result,
+            };
+        }
+        if !grant.proxy {
+            stream
+                .respond(Response::builder().status(403).body(())?)
+                .await?;
+            stream.finish().await?;
+            return Ok(());
+        }
+        let private = grant.allow_private;
+        let target = request.uri().authority().unwrap().as_str();
+        let tcp = tokio::select! {
+            biased;
+            _ = grant.cancelled() => return Ok(()),
+            tcp = crate::connect_target(target, private) => match tcp {
+                Ok(tcp) => tcp,
+                Err(_) => { stream.respond(Response::builder().status(502).body(())?).await?; stream.finish().await?; return Ok(()); }
+            },
+        };
+        stream
+            .respond(Response::builder().status(200).body(())?)
+            .await?;
+        let (mut send, mut recv) = stream.split();
+        let (mut read, mut write) = tcp.into_split();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upload = async {
+            let mut buffer = vec![0; crate::CHUNK];
+            loop {
+                let n = read.read(&mut buffer).await?;
+                if n == 0 {
+                    send.finish().await?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+                send.send(Bytes::copy_from_slice(&buffer[..n])).await?;
+            }
+        };
+        let download = async {
+            while let Some(data) = recv.recv().await? {
+                write.write_all(&data).await?;
+            }
+            write.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            biased;
+            _ = grant.cancelled() => Ok(()),
+            result = async { tokio::try_join!(upload, download)?; Ok(()) } => result,
+        }
     }
 }
 

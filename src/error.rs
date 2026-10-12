@@ -25,3 +25,53 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Conservative candidate fallback: certificate, authentication, policy and
+    /// unclassified protocol failures never trigger another transport.
+    pub fn permits_transport_fallback(&self) -> bool {
+        match self {
+            Self::Timeout(_) | Self::PathMtu { .. } | Self::Closed => true,
+            Self::Rejected(501) => true,
+            Self::Unsupported("QUIC datagrams") => true,
+            Self::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::TimedOut
+            ),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fallback_never_masks_identity_authorization_or_protocol_failure() {
+        for error in [
+            Error::Tls(anyhow::anyhow!("untrusted certificate")),
+            Error::Rejected(401),
+            Error::Rejected(403),
+            Error::Rejected(409),
+            Error::Unsupported("invalid capsule negotiation"),
+            Error::Protocol(anyhow::anyhow!("malformed frame")),
+        ] {
+            assert!(!error.permits_transport_fallback(), "{error}");
+        }
+        for error in [
+            Error::Timeout("QUIC handshake"),
+            Error::Rejected(501),
+            Error::PathMtu {
+                required: 1280,
+                available: 1200,
+            },
+            Error::Io(std::io::ErrorKind::ConnectionRefused.into()),
+        ] {
+            assert!(error.permits_transport_fallback(), "{error}");
+        }
+    }
+}

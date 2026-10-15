@@ -58,17 +58,19 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   tests verify packet transfer over two carriers and no premature device drop.
 - Floppa network-change handling now replaces the carrier through that session;
   a manager-level test verifies device ownership remains stable and forwarding
-  resumes. Actor-wide retry states and session-scoped Android Underlay remain open.
+  resumes. Socket preparation is now session-scoped in Floppa; actor-wide retry states
+  and underlay DNS/candidate resolution remain open.
 - Floppa config v2 has a cached dual-stack NetworkPlan and explicit route exclusions.
   Android uses its provisioned routes; desktop rolls back every configured address.
   v1 imports explicitly require reissuance. 236 Floppa core unit tests and four
-  integration tests pass. H3-only currently reports unavailable; Auto uses H2
-  until the H3 VPN bridge and candidate selection are connected.
+  integration tests passed at that increment. H3-only and conservative Auto
+  selection were connected in the following H3 increment below.
 - Server-owned generation admission replaces authorizer-side revocation. Packet
   device preparation and request cancellation checks precede commit. Aborted,
   revoked and stale candidates preserve the active generation; failed factory
   preparation is covered by a Floppa forwarding regression.
-- No Android ADB device is currently connected; physical acceptance is pending.
+- Physical Android acceptance is pending. On 2026-10-15, a Pixel 8 Pro is
+  reachable over ADB but has an active Floppa VPN; it has not been interrupted.
 - Shared `router::Router` owns one packet device. Peer factories reserve disjoint
   source prefixes before admission and activate routes only when the admitted
   bridge starts polling. Per-peer queues are byte-bounded (1 MiB/direction),
@@ -99,3 +101,22 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
 - H3 TCP backpressure passed with 128 MiB in each direction and deliberately held
   readers. Both directions stall and resume while preserving payload and FIN.
   Full latency/loss matrix, physical Android and isolated Singapore remain pending.
+
+- Floppa Underlay now owns TCP/UDP socket preparation for one session. Linux
+  applies SO_MARK; Android captures the exact VpnService instance/generation,
+  protects sockets and binds them to the underlying Network before transmission.
+  A retired service cannot borrow the successor's protector. Late network-change
+  events are checked against the current Foldfin generation under the tunnel lock.
+  Foldfin no longer uses the global Android socket callback. Existing resolver
+  and endpoint selection are unchanged; network-generation snapshots and scoped
+  DNS/candidate selection remain pending.
+- Host validation: 238 unit tests and eight Floppa integration tests, including
+  zero TCP/UDP transmission on preparation refusal, retained preparation across
+  H2/H3 recovery, service retirement and stale notification rejection. Android
+  Rust/JNI checks and core/application Clippy passed; device acceptance is separate.
+
+- Floppa arm64 debug APK now builds through Rust/JNI and Kotlin. Debug signing
+  configuration was fixed to work without release credentials. Extra Android lint
+  reports the existing core-ktx 1.19.0 -> 1.19.1 GradleDependency finding only.
+  APK and logs: /home/okhsunrog/tmp_zfs/codex_tmp/foldfin-underlay/.
+  Installation on the currently active Pixel VPN awaits the user's answer.

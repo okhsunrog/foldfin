@@ -127,3 +127,15 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   floppa-foldfin-lab-arm64-debug.apk under the temporary root above. Installing it
   preserves the existing application; activating its VPN still interrupts the
   current VPN and awaits the user's reply.
+
+- Floppa was rebased onto main 60bc70b and now uses its mandatory Linux SO_MARK,
+  shared route subtraction, endpoint resolver/cache and persistent retry settings.
+  Linux route events do not trigger endpoint-route rewrites or unconditional
+  tunnel replacement. Initial Foldfin attempts walk all configured endpoints,
+  preserving TLS identity and applying rollback before retrying a failed address.
+  Network/capability failures permit fallback; typed TLS/auth/policy rejection
+  terminates the actor cycle, including on Android. Carrier-only recovery still
+  needs fresh resolution and actor-owned retained-TUN retry states.
+- Per the revised validation order, finish implementation/integration first;
+  device/WAN acceptance is deferred. No phone installation or VPN interruption
+  is currently requested. Local code/regression checks continue on the laptop.

@@ -120,3 +120,10 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   reports the existing core-ktx 1.19.0 -> 1.19.1 GradleDependency finding only.
   APK and logs: /home/okhsunrog/tmp_zfs/codex_tmp/foldfin-underlay/.
   Installation on the currently active Pixel VPN awaits the user's answer.
+
+- The Pixel's installed signing certificate differs from the debug build. No
+  uninstall/replacement was attempted. A separate `.foldfinlab` package was built
+  and its application ID verified. Artifact: foldfin-underlay/artifacts/
+  floppa-foldfin-lab-arm64-debug.apk under the temporary root above. Installing it
+  preserves the existing application; activating its VPN still interrupts the
+  current VPN and awaits the user's reply.

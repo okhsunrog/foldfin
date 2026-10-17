@@ -5,7 +5,7 @@ Floppa host. This is a source review, not a completed multi-user deployment audi
 The existing Singapore transport acceptance used a temporary static credential;
 it did not exercise provisioning, database synchronization or certificate renewal.
 
-## Findings
+## Findings at review start
 
 1. **Release blocker: there is no production grant delivery path.**
    Floppa's `DeviceRegistry` is used by integration tests, not by a database-backed
@@ -72,8 +72,22 @@ it did not exercise provisioning, database synchronization or certificate renewa
   Keep the 128 MiB bidirectional data/backpressure assertions and allow 60 seconds
   per transfer; this test does not specify a minimum debug-build throughput.
 
-The API/database/node path, isolation deployment, plan limits, certificate issuance
-and full multi-user acceptance are still open. These fixes do not complete them.
+The accompanying Floppa implementation adds the API/database/node path: digest-only
+per-device issuance, quota serialization shared with WG/AWG, stable regional address
+allocation, logout/region revocation, subscription-bounded leases and complete snapshot
+reconciliation. Policy changes publish configuration revisions. A shared H2/H3 node
+applies per-device bandwidth and private/client isolation, and supervises the packet
+router. Deployment includes a systemd service, network template generation, a restricted
+DB role, a certificate deploy hook and a dedicated musl build/package target.
+
+Local PostgreSQL/API and real H2/H3 tests cover this path, including two peers, IPv4/IPv6,
+related ICMP errors, renewal, rotation, subscription expiry, failed snapshots, DB-pool
+outage, recovery and shutdown on packet-device failure. The static musl node also passed real TUN/nftables acceptance, running unprivileged
+in a local three-namespace topology: IPv4/IPv6 TCP, UDP and ICMP over H2/H3, followed
+by process and namespace cleanup. This is not a deployed Singapore multi-user service. ACME issuance and installation of the supplied deployment files
+remain infrastructure rollout work. Per-region DB RLS and per-account traffic accounting
+are not implemented. The current plan bandwidth limit is enforced per device/direction.
+See the Floppa checkout's `docs/FOLDFIN-SERVER.md` for the executable/operator contract.
 
 ## Ownership and target architecture
 
@@ -113,3 +127,21 @@ returned once and persisted as digests; lost client credentials require rotation
 
 Full/split client routes, OS DNS application and physical Android acceptance remain
 separate release gates even after the server path passes.
+
+Floppa implementation: commit `4683ed6` in `floppa-vpn-foldfin`. Server acceptance:
+177 Rust tests, workspace offline check and Clippy, generated API/cache checks,
+frontend build, static musl build and isolated real-TUN acceptance passed.
+
+## Architectural conclusion
+
+Keep the protocol crate and its H2/H3 wire architecture. The missing work was primarily
+in host policy, control-plane delivery and lifecycle supervision, with two concrete
+transport/router defects fixed above. Accounts, plans, certificates and kernel network
+setup belong to Floppa/deployment; adding those to the protocol would create a second
+source of truth. No Chromium stack, custom mux or second account database is required.
+
+Release remains gated on deploying the multi-user node through the isolated physical
+Singapore path, exercising the real TUN/firewall/NAT with its issued profiles, and
+publishing/pinning the protocol source for CI rather than relying on adjacent local
+checkouts. Client API-driven provisioning, full/split DNS lifecycle and Android runtime
+acceptance are separate from the completed server implementation.

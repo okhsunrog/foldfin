@@ -139,3 +139,17 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
 - Per the revised validation order, finish implementation/integration first;
   device/WAN acceptance is deferred. No phone installation or VPN interruption
   is currently requested. Local code/regression checks continue on the laptop.
+
+- Floppa now retains TUN/platform state during actor-owned carrier recovery
+  (`bace384`): bounded retries, offline parking, cancellation joined before
+  rollback, and stale-observation rejection. Public UI uses its existing Retrying
+  phase; carrier probes no longer count as received payload.
+- Recovery discovery now uses session-prepared DoH sockets and the shared endpoint
+  cache, then walks provisioned endpoints and resolved addresses. Linux applies
+  SO_MARK; Android uses the captured service instance. TLS identity and provisioned
+  network state remain unchanged. Private DNS names need cached candidates or a
+  host-supplied Underlay resolver; initial connection discovery is unchanged.
+- Latest laptop validation: 14 resolver/relay tests, 284 core tests and 13 Foldfin
+  integration tests pass; host check/Clippy and Android all-target Clippy pass.
+  Logs: /home/okhsunrog/tmp_zfs/codex_tmp/foldfin-discovery/.
+  Public resolver reachability and physical roaming remain untested.

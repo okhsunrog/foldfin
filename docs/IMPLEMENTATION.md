@@ -164,3 +164,16 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   /home/okhsunrog/tmp_zfs/codex_tmp/foldfin-physical-discovery/run-5/.
   This is scoped DNS/outer connectivity acceptance only; remote Foldfin recovery,
   IPv6 WAN forwarding and Android roaming are still pending.
+
+- Real Floppa actor recovery passed against a disposable current Foldfin server on
+  Singapore through the physical Ethernet namespace path. H2 TCP socket destruction
+  and H3 lab-server restart both recover without changing TUN ifindex, addresses,
+  MTU, routes/rules or connected_at. TCP/FIN, UDP, DNS packets and ICMP pass before
+  and after each fault; explicit Down completes rollback. Client mount isolation
+  keeps the host ownership lock and privileged rollback journal separate.
+- Evidence: /home/okhsunrog/tmp_zfs/codex_tmp/foldfin-recovery-wan/run-2/.
+  Actual carrier captures and server-observed physical source are recorded.
+  Local/remote cleanup pass; the production service retains its MainPID. The lab
+  uses its own temporary binary, token, TUN, peer subnet and source-limited port.
+  IPv4 routed acceptance does not cover full tunnel, OS DNS application, existing
+  flow continuity, prolonged outages, physical IPv6 or Android roaming.

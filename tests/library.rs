@@ -414,7 +414,9 @@ async fn slow_reader_backpressure(h3: bool) {
         }
         upstream.shutdown().await.unwrap();
     });
-    let mut flow = timeout(Duration::from_secs(10), producer)
+    // Completion is a correctness bound, not a throughput benchmark. Debug QUIC
+    // on a loaded builder can take tens of seconds for 128 MiB in each direction.
+    let mut flow = timeout(Duration::from_secs(60), producer)
         .await
         .unwrap()
         .unwrap();
@@ -423,7 +425,7 @@ async fn slow_reader_backpressure(h3: bool) {
             .await
             .is_err()
     );
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(60), async {
         let mut count = 0;
         let mut chunk = [0; CHUNK];
         loop {
@@ -530,6 +532,137 @@ async fn session_retains_packet_device_across_loss_failed_recovery_and_new_carri
     session.stop().await.unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 2);
     assert_eq!(session.snapshot(), Event::Closed);
+}
+
+#[tokio::test]
+async fn router_failure_is_observable_and_releases_the_device() {
+    use foldfin::{admission::PeerId, router::Router};
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (device, inject, _received) = device(drops.clone());
+    let mut router = Router::start(device);
+    let factory = router
+        .peer(
+            PeerId::new("one").unwrap(),
+            config("198.18.0.2", "198.18.0.1"),
+        )
+        .unwrap();
+    let mut peer = factory.open().unwrap();
+    // Cancelling supervision does not detach the runner or consume its result.
+    assert!(
+        timeout(Duration::from_millis(10), router.closed())
+            .await
+            .is_err()
+    );
+    drop(inject);
+    timeout(Duration::from_secs(2), router.closed())
+        .await
+        .unwrap();
+    assert!(factory.open().is_err());
+    assert!(
+        std::future::poll_fn(|cx| peer.recv.poll_recv(cx, &mut [0; 1500]))
+            .await
+            .is_err()
+    );
+    assert!(router.stop().await.is_err());
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn router_adapter_panic_closes_peers_and_is_reported_on_join() {
+    use foldfin::{admission::PeerId, router::Router};
+    struct PanickingWriter;
+    impl PacketSend for PanickingWriter {
+        fn poll_send(&mut self, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<()>> {
+            panic!("injected packet adapter failure");
+        }
+    }
+    let (device, _inject, _) = device(Arc::new(AtomicUsize::new(0)));
+    let mut router = Router::start(PacketDevice {
+        recv: device.recv,
+        send: Box::new(PanickingWriter),
+    });
+    let factory = router
+        .peer(
+            PeerId::new("one").unwrap(),
+            config("198.18.0.2", "198.18.0.1"),
+        )
+        .unwrap();
+    let mut peer = factory.open().unwrap();
+    let packet = packet([198, 18, 0, 1], [198, 18, 0, 2]);
+    std::future::poll_fn(|cx| peer.send.poll_send(cx, &packet))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), router.closed())
+        .await
+        .unwrap();
+    assert!(factory.open().is_err());
+    assert!(
+        std::future::poll_fn(|cx| peer.recv.poll_recv(cx, &mut [0; 1500]))
+            .await
+            .is_err()
+    );
+    assert!(router.stop().await.is_err());
+    drop(peer);
+}
+
+#[tokio::test]
+async fn replacing_peer_wakes_a_stale_pending_kernel_write() {
+    use foldfin::{admission::PeerId, router::Router};
+    use std::future::poll_fn;
+    struct BlockOld {
+        polled: mpsc::UnboundedSender<()>,
+        delivered: mpsc::UnboundedSender<Vec<u8>>,
+    }
+    impl PacketSend for BlockOld {
+        fn poll_send(&mut self, _: &mut Context<'_>, packet: &[u8]) -> Poll<io::Result<()>> {
+            if packet[1] == 0 {
+                self.polled.send(()).unwrap();
+                // The old packet never becomes writable. Replacement must cancel it.
+                Poll::Pending
+            } else {
+                Poll::Ready(
+                    self.delivered
+                        .send(packet.to_vec())
+                        .map_err(io::Error::other),
+                )
+            }
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (device, _inject, _) = device(drops);
+    let (polled, mut waiting) = mpsc::unbounded_channel();
+    let (delivered, mut received) = mpsc::unbounded_channel();
+    let mut router = Router::start(PacketDevice {
+        recv: device.recv,
+        send: Box::new(BlockOld { polled, delivered }),
+    });
+    let factory = router
+        .peer(
+            PeerId::new("one").unwrap(),
+            config("198.18.0.2", "198.18.0.1"),
+        )
+        .unwrap();
+    let mut old = factory.open().unwrap();
+    let packet = packet([198, 18, 0, 1], [198, 18, 0, 2]);
+    poll_fn(|cx| old.send.poll_send(cx, &packet)).await.unwrap();
+    timeout(Duration::from_secs(2), waiting.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut next = factory.open().unwrap();
+    let mut new_packet = packet;
+    new_packet[1] = 1;
+    poll_fn(|cx| next.send.poll_send(cx, &new_packet))
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        new_packet
+    );
+    router.stop().await.unwrap();
 }
 
 #[tokio::test]
@@ -768,8 +901,15 @@ async fn h3_proxy_preserves_half_close_and_cancels_upstream_on_drop() {
     })
     .await
     .unwrap();
-    let cancelled = client.open_tcp(&target).await.unwrap();
+    let mut cancelled = client.open_tcp(&target).await.unwrap();
     let (mut upstream, _) = listener.accept().await.unwrap();
+    // Cancellation must also work after the QUIC reader has returned Pending.
+    // h3-quinn 0.0.10 previously moved its stream out and panicked on this drop.
+    assert!(
+        timeout(Duration::from_millis(20), cancelled.read_u8())
+            .await
+            .is_err()
+    );
     drop(cancelled);
     let read = timeout(Duration::from_secs(3), upstream.read(&mut [0; 1]))
         .await

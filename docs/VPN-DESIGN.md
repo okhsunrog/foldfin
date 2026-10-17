@@ -1,5 +1,11 @@
 # VPN: рекомендуемая архитектура
 
+> Исторический проект первого H2-прототипа. С тех пор реализованы H3, shared router
+> и retained-session recovery, а Chromium/BoringSSL удалён. Текущие решения:
+> [ARCHITECTURE.md](ARCHITECTURE.md), [IMPLEMENTATION.md](IMPLEMENTATION.md) и
+> [SERVER-REVIEW.md](SERVER-REVIEW.md). Упоминания Chrome и старой очередности ниже
+> сохранены как история, а не текущие требования.
+
 Статус: архитектура целевого VPN; первая часть реализована как Linux static-peer
 prototype с DATAGRAM/configuration capsules и routed prefixes. OS addresses/routes пока готовятся отдельно.
 Рабочий SOCKS5 TCP-прокси сохранён. Этот документ заменяет прежнее

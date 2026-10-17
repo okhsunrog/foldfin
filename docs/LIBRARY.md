@@ -119,10 +119,24 @@ credential and its proxy flows. Floppa uses this for authenticated carrier repla
 revoke the previous VPN lease, await its shared device slot, then admit the successor.
 The shared slot still guards packet-device ownership across credential changes.
 
-The CLI retains one configured bearer token and one static VPN session. Multiple
-authorized devices require isolated packet endpoints: a shared TUN owner/router
-is still host work. Do not attach competing readers to one named TUN by increasing
-the semaphore. Public source IP is never an identity or a grant key.
+The CLI retains one configured bearer token and one static VPN session. A multi-peer
+host starts one `router::Router` with its prepared packet device and obtains isolated
+factories with `Router::peer(PeerId, vpn::Config)`. The router reserves disjoint
+source prefixes, activates admitted generations on packet polling, and bounds each
+peer's queues. Do not attach competing readers to one named TUN by increasing the
+semaphore. Public source IP is never an identity or a grant key.
+
+Supervise `Router::closed()` alongside listeners and control-plane synchronization.
+It is cancellation-safe and wakes on IO failure, panic or stop. `Router::stop()`
+joins the runner and returns its failure before host platform teardown. Prefix
+validation does not replace destination/client isolation when grants contain default
+routes; the host must explicitly enforce those permissions.
+
+TLS renewal need not replace the `Server`. Floppa's host-side `TlsIdentity` supplies
+a shared rustls certificate resolver: a validated certificate/key pair is atomically
+published to future H2/H3 handshakes while established flows remain alive. Issuance,
+validity/name checks and file watching are host/deployment responsibilities. A pinned
+self-signed certificate is not transparently renewable without updating client trust.
 
 ## Floppa integration
 
@@ -135,8 +149,8 @@ Windows/macOS Foldfin device adapters are not implemented.
 
 `floppa-foldfin::DeviceRegistry` adapts committed device grants to `Authorizer`,
 stores credential digests, supports replacement/revocation and bounded grant
-lifetimes. PostgreSQL issuance, subscription/region synchronization, shared TUN
-routing and automatic Foldfin provisioning are not wired yet. See Floppa's
+lifetimes. PostgreSQL issuance, subscription/region synchronization, node process
+orchestration and automatic Foldfin provisioning are not wired yet. See Floppa's
 `docs/FOLDFIN.md` for the proposed control-plane design and exact current scope.
 
 ## Control state and statistics

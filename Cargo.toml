@@ -36,6 +36,7 @@ h3 = ["rustls", "dep:quinn", "dep:h3", "dep:h3-quinn", "dep:h3-datagram"]
 [patch.crates-io]
 h3 = { path = "vendor/h3" }
 h3-datagram = { path = "vendor/h3-datagram" }
+h3-quinn = { path = "vendor/h3-quinn" }
 
 [[bin]]
 name = "foldfin"

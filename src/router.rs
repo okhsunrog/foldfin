@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 
 const QUEUE_BYTES: usize = 1024 * 1024;
 #[derive(Default)]
@@ -67,6 +67,7 @@ struct State {
     active: HashMap<PeerId, u64>,
     round_robin: VecDeque<u64>,
     input_waker: Option<Waker>,
+    output_waker: Option<Waker>,
     closed: bool,
     stats: RouterStats,
 }
@@ -81,20 +82,37 @@ type Shared = Arc<Mutex<State>>;
 pub struct Router {
     shared: Shared,
     task: Option<JoinHandle<io::Result<()>>>,
+    terminated: watch::Receiver<bool>,
+}
+// Also close peer queues if a host packet adapter panics or the runner is aborted.
+struct RunnerGuard(Shared, watch::Sender<bool>);
+impl Drop for RunnerGuard {
+    fn drop(&mut self) {
+        close(&self.0);
+        self.1.send_replace(true);
+    }
 }
 impl Router {
     pub fn start(device: PacketDevice) -> Self {
         let shared = Shared::default();
         let owner = shared.clone();
+        let (finished, terminated) = watch::channel(false);
+        let guard = RunnerGuard(owner.clone(), finished);
         let task = tokio::spawn(async move {
-            let result = run(device, owner.clone()).await;
-            close(&owner);
-            result
+            let _guard = guard;
+            run(device, owner).await
         });
         Self {
             shared,
             task: Some(task),
+            terminated,
         }
+    }
+    /// Supervise packet IO alongside listeners and control-plane synchronization.
+    /// Cancellation-safe; call `stop` afterwards to join and retrieve the failure.
+    pub async fn closed(&self) {
+        let mut terminated = self.terminated.clone();
+        let _ = terminated.wait_for(|finished| *finished).await;
     }
     /// Creates an inert factory. `open` reserves prefixes and prepares queues;
     /// routes activate on the first packet poll, after server admission commits.
@@ -111,7 +129,10 @@ impl Router {
         }))
     }
     pub fn stats(&self) -> RouterStats {
-        self.shared.lock().unwrap().stats
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats
     }
     pub async fn stop(&mut self) -> io::Result<()> {
         let result = if let Some(task) = self.task.as_mut() {
@@ -144,13 +165,18 @@ fn closed() -> io::Error {
     )
 }
 fn close(shared: &Shared) {
-    let mut state = shared.lock().unwrap();
+    // The host's poll_send implementation may have panicked while holding this
+    // lock. Teardown must still wake waiters rather than panic during unwinding.
+    let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
     state.closed = true;
     for peer in state.peers.values_mut() {
         peer.inbound.wake();
         peer.outbound.wake();
     }
     if let Some(waker) = state.input_waker.take() {
+        waker.wake();
+    }
+    if let Some(waker) = state.output_waker.take() {
         waker.wake();
     }
 }
@@ -169,7 +195,10 @@ impl PacketDeviceFactory for Factory {
             .map(IpNet::from)
             .chain(self.config.peer_routes.iter().copied())
             .collect();
-        let mut state = self.shared.lock().unwrap();
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed {
             return Err(closed());
         }
@@ -219,8 +248,14 @@ struct Registration {
 }
 impl Registration {
     fn activate(&self) -> io::Result<()> {
-        let mut activated = self.activated.lock().unwrap();
-        let mut state = self.shared.lock().unwrap();
+        let mut activated = self
+            .activated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed {
             return Err(closed());
         }
@@ -239,6 +274,9 @@ impl Registration {
                 }
             }
             state.round_robin.push_back(self.id);
+            if let Some(waker) = state.output_waker.take() {
+                waker.wake();
+            }
             *activated = true;
             if let Some(waker) = state.input_waker.take() {
                 waker.wake();
@@ -252,20 +290,30 @@ impl Registration {
 }
 impl Drop for Registration {
     fn drop(&mut self) {
-        let mut state = self.shared.lock().unwrap();
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(peer) = state.peers.remove(&self.id)
             && state.active.get(&peer.identity) == Some(&self.id)
         {
             state.active.remove(&peer.identity);
         }
         state.round_robin.retain(|id| *id != self.id);
+        if let Some(waker) = state.output_waker.take() {
+            waker.wake();
+        }
     }
 }
 struct Reader(Arc<Registration>);
 impl PacketRecv for Reader {
     fn poll_recv(&mut self, cx: &mut Context<'_>, buffer: &mut [u8]) -> Poll<io::Result<usize>> {
         self.0.activate()?;
-        let mut state = self.0.shared.lock().unwrap();
+        let mut state = self
+            .0
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed
             || !state
                 .peers
@@ -294,7 +342,11 @@ struct Writer(Arc<Registration>);
 impl PacketSend for Writer {
     fn poll_send(&mut self, cx: &mut Context<'_>, packet: &[u8]) -> Poll<io::Result<()>> {
         self.0.activate()?;
-        let mut state = self.0.shared.lock().unwrap();
+        let mut state = self
+            .0
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed
             || !state
                 .peers
@@ -332,7 +384,9 @@ async fn run(mut device: PacketDevice, shared: Shared) -> io::Result<()> {
                 return Err(closed());
             }
             {
-                let mut state = shared.lock().unwrap();
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let selected = vpn::addresses(&buffer[..length]).and_then(|(src, dst)| {
                     state
                         .active
@@ -364,7 +418,9 @@ async fn run(mut device: PacketDevice, shared: Shared) -> io::Result<()> {
     let inbound = async {
         loop {
             let (id, packet) = poll_fn(|cx| {
-                let mut state = shared.lock().unwrap();
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.closed {
                     return Poll::Ready(Err(closed()));
                 }
@@ -382,7 +438,9 @@ async fn run(mut device: PacketDevice, shared: Shared) -> io::Result<()> {
             poll_fn(|cx| {
                 // Serialize a pending write with replacement/revocation. An old
                 // generation cannot resume writing after a successor activates.
-                let state = shared.lock().unwrap();
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !state
                     .peers
                     .get(&id)
@@ -390,7 +448,9 @@ async fn run(mut device: PacketDevice, shared: Shared) -> io::Result<()> {
                 {
                     return Poll::Ready(Ok(()));
                 }
-                device.send.poll_send(cx, &packet)
+                let result = device.send.poll_send(cx, &packet);
+                state.output_waker = result.is_pending().then(|| cx.waker().clone());
+                result
             })
             .await?;
             tokio::task::yield_now().await;

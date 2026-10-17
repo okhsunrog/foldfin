@@ -153,3 +153,14 @@ Unavailable device/WAN acceptance must remain explicitly incomplete.
   integration tests pass; host check/Clippy and Android all-target Clippy pass.
   Logs: /home/okhsunrog/tmp_zfs/codex_tmp/foldfin-discovery/.
   Public resolver reachability and physical roaming remain untested.
+
+- Linux scoped discovery physically validated on 2026-10-17 in an isolated
+  namespace/veth/NAT path through Ethernet, with unmarked external sockets
+  blackholed. Fresh DoH returned Singapore; an owned TCP marker was correlated by
+  source port with the source seen by Singapore and captures at both ends.
+  Temporary firewalld veth membership and namespace-only rp_filter adjustment
+  account for the current host/test fixture. Cleanup preserved host routes,
+  policy rules, DNS and global sysctls. Evidence:
+  /home/okhsunrog/tmp_zfs/codex_tmp/foldfin-physical-discovery/run-5/.
+  This is scoped DNS/outer connectivity acceptance only; remote Foldfin recovery,
+  IPv6 WAN forwarding and Android roaming are still pending.

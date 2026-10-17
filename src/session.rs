@@ -119,6 +119,7 @@ pub struct Session {
     started: Instant,
     completed_tx: u64,
     completed_rx: u64,
+    cleanup_error: Option<Error>,
 }
 impl Session {
     pub fn new(config: vpn::Config, device: PacketDevice) -> Result<Self> {
@@ -134,6 +135,7 @@ impl Session {
             started: Instant::now(),
             completed_tx: 0,
             completed_rx: 0,
+            cleanup_error: None,
         })
     }
     pub fn subscribe(&self) -> watch::Receiver<Event> {
@@ -169,6 +171,7 @@ impl Session {
             ));
         }
         self.stop_carrier().await;
+        self.report_cleanup_error();
         self.events.send_replace(Event::Recovering);
         self.client = Some(client.into());
         let result = self
@@ -181,6 +184,7 @@ impl Session {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.stop_carrier().await;
+                self.report_cleanup_error();
                 self.events.send_replace(Event::CarrierLost {
                     detail: error.to_string(),
                 });
@@ -226,6 +230,7 @@ impl Session {
     /// packet ownership. No connection is made until the host calls recover.
     pub async fn underlay_changed(&mut self) {
         self.stop_carrier().await;
+        self.report_cleanup_error();
         if self.device.is_some() {
             self.events.send_replace(Event::CarrierLost {
                 detail: "underlay changed".into(),
@@ -236,29 +241,45 @@ impl Session {
         // Retain handles while awaiting them: cancellation never detaches cleanup.
         if let Some(monitor) = self.monitor.as_mut() {
             monitor.abort();
-            let _ = monitor.await;
+            if let Err(error) = monitor.await
+                && !error.is_cancelled()
+            {
+                self.cleanup_error
+                    .get_or_insert(Error::Protocol(error.into()));
+            }
         }
         self.monitor.take();
-        if let Some(tunnel) = self.tunnel.as_mut() {
-            let _ = tunnel.stop_mut().await;
+        if let Some(tunnel) = self.tunnel.as_mut()
+            && let Err(error) = tunnel.stop_mut().await
+        {
+            self.cleanup_error.get_or_insert(error);
         }
         if let Some(tunnel) = self.tunnel.take() {
             let stats = tunnel.stats();
             self.completed_tx += stats.tx_bytes;
             self.completed_rx += stats.rx_bytes;
         }
-        if let Some(client) = &self.client {
-            let _ = client.stop().await;
+        if let Some(client) = &self.client
+            && let Err(error) = client.stop().await
+        {
+            self.cleanup_error.get_or_insert(error);
         }
         self.client.take();
     }
+    fn report_cleanup_error(&mut self) {
+        if let Some(error) = self.cleanup_error.take() {
+            tracing::debug!(%error, "previous carrier failed; teardown completed");
+        }
+    }
     /// Joins carrier tasks before releasing the packet device. May be retried if
     /// the caller cancels this future; no packet device is released prematurely.
+    /// Returns the first task failure after completing cleanup, including a prior
+    /// forwarding failure. An error does not mean the device is still owned.
     pub async fn stop(&mut self) -> Result<()> {
         self.stop_carrier().await;
         self.device.take();
         self.events.send_replace(Event::Closed);
-        Ok(())
+        self.cleanup_error.take().map_or(Ok(()), Err)
     }
 }
 impl Drop for Session {

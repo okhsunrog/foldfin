@@ -16,7 +16,23 @@ use std::{
 };
 use tokio::{sync::watch, task::JoinHandle};
 
-const QUEUE_BYTES: usize = 1024 * 1024;
+/// Payload limits for router queues, excluding transport buffers and one packet
+/// being written to the device. Limits do not reserve memory or promise fairness.
+#[derive(Clone, Copy, Debug)]
+pub struct RouterConfig {
+    /// Payload capacity of each peer queue, separately for each direction.
+    pub per_peer_queue_bytes: usize,
+    /// Shared payload capacity across both directions and all peer queues.
+    pub total_queue_bytes: usize,
+}
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            per_peer_queue_bytes: 1024 * 1024,
+            total_queue_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
 #[derive(Default)]
 struct Queue {
     packets: VecDeque<Bytes>,
@@ -25,16 +41,12 @@ struct Queue {
     writer: Option<Waker>,
 }
 impl Queue {
-    fn push(&mut self, packet: Bytes) -> bool {
-        if self.bytes + packet.len() > QUEUE_BYTES {
-            return false;
-        }
+    fn push(&mut self, packet: Bytes) {
         self.bytes += packet.len();
         self.packets.push_back(packet);
         if let Some(waker) = self.reader.take() {
             waker.wake();
         }
-        true
     }
     fn pop(&mut self) -> Option<Bytes> {
         let packet = self.packets.pop_front()?;
@@ -62,6 +74,8 @@ struct Peer {
 }
 #[derive(Default)]
 struct State {
+    config: RouterConfig,
+    budget_waiters: HashMap<u64, Waker>,
     next: u64,
     peers: HashMap<u64, Peer>,
     active: HashMap<PeerId, u64>,
@@ -76,6 +90,38 @@ pub struct RouterStats {
     pub unroutable_packets: u64,
     pub full_queue_drops: u64,
     pub rejected_packets: u64,
+    /// Current queued payload, both directions and all registrations.
+    pub queued_bytes: usize,
+    pub peak_queued_bytes: usize,
+    /// Outbound drops caused by the shared budget (also in full_queue_drops).
+    pub global_budget_drops: u64,
+}
+impl State {
+    fn reserve(&mut self, bytes: usize) {
+        self.stats.queued_bytes += bytes;
+        self.stats.peak_queued_bytes = self.stats.peak_queued_bytes.max(self.stats.queued_bytes);
+    }
+    fn release(&mut self, bytes: usize) {
+        self.stats.queued_bytes -= bytes;
+        if bytes != 0 {
+            for (_, waker) in self.budget_waiters.drain() {
+                waker.wake();
+            }
+        }
+    }
+    fn clear_peer(&mut self, id: u64) {
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.inbound.wake();
+            peer.outbound.wake();
+            let bytes = peer.inbound.bytes + peer.outbound.bytes;
+            peer.inbound = Queue::default();
+            peer.outbound = Queue::default();
+            self.release(bytes);
+        }
+        if let Some(waker) = self.budget_waiters.remove(&id) {
+            waker.wake();
+        }
+    }
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -94,7 +140,22 @@ impl Drop for RunnerGuard {
 }
 impl Router {
     pub fn start(device: PacketDevice) -> Self {
-        let shared = Shared::default();
+        Self::start_with_config(device, RouterConfig::default())
+            .expect("valid default router limits")
+    }
+    /// Each limit must fit a complete engine packet. A full inbound queue applies
+    /// backpressure; a full outbound queue drops without stalling other peers.
+    pub fn start_with_config(device: PacketDevice, config: RouterConfig) -> io::Result<Self> {
+        if config.per_peer_queue_bytes < vpn::MTU || config.total_queue_bytes < vpn::MTU {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "router limits must fit the VPN MTU",
+            ));
+        }
+        let shared = Arc::new(Mutex::new(State {
+            config,
+            ..State::default()
+        }));
         let owner = shared.clone();
         let (finished, terminated) = watch::channel(false);
         let guard = RunnerGuard(owner.clone(), finished);
@@ -102,11 +163,11 @@ impl Router {
             let _guard = guard;
             run(device, owner).await
         });
-        Self {
+        Ok(Self {
             shared,
             task: Some(task),
             terminated,
-        }
+        })
     }
     /// Supervise packet IO alongside listeners and control-plane synchronization.
     /// Cancellation-safe; call `stop` afterwards to join and retrieve the failure.
@@ -169,9 +230,8 @@ fn close(shared: &Shared) {
     // lock. Teardown must still wake waiters rather than panic during unwinding.
     let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
     state.closed = true;
-    for peer in state.peers.values_mut() {
-        peer.inbound.wake();
-        peer.outbound.wake();
+    for id in state.peers.keys().copied().collect::<Vec<_>>() {
+        state.clear_peer(id);
     }
     if let Some(waker) = state.input_waker.take() {
         waker.wake();
@@ -268,10 +328,7 @@ impl Registration {
         if !*activated {
             if let Some(old) = state.active.insert(identity.clone(), self.id) {
                 state.round_robin.retain(|id| *id != old);
-                if let Some(peer) = state.peers.get_mut(&old) {
-                    peer.inbound.wake();
-                    peer.outbound.wake();
-                }
+                state.clear_peer(old);
             }
             state.round_robin.push_back(self.id);
             if let Some(waker) = state.output_waker.take() {
@@ -294,6 +351,7 @@ impl Drop for Registration {
             .shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.clear_peer(self.id);
         if let Some(peer) = state.peers.remove(&self.id)
             && state.active.get(&peer.identity) == Some(&self.id)
         {
@@ -323,14 +381,16 @@ impl PacketRecv for Reader {
             return Poll::Ready(Err(closed()));
         }
         let queue = &mut state.peers.get_mut(&self.0.id).ok_or_else(closed)?.outbound;
-        if let Some(packet) = queue.pop() {
+        if let Some(packet) = queue.packets.front() {
             if packet.len() > buffer.len() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "packet receive buffer too small",
                 )));
             }
+            let packet = queue.pop().unwrap();
             buffer[..packet.len()].copy_from_slice(&packet);
+            state.release(packet.len());
             Poll::Ready(Ok(packet.len()))
         } else {
             queue.reader = Some(cx.waker().clone());
@@ -355,6 +415,7 @@ impl PacketSend for Writer {
         {
             return Poll::Ready(Err(closed()));
         }
+        let limit = state.config.per_peer_queue_bytes;
         let peer = state.peers.get_mut(&self.0.id).ok_or_else(closed)?;
         if !vpn::addresses(packet).is_some_and(|(src, dst)| peer.config.incoming(src, dst)) {
             state.stats.rejected_packets += 1;
@@ -363,11 +424,34 @@ impl PacketSend for Writer {
                 "packet violates peer policy",
             )));
         }
-        if peer.inbound.bytes + packet.len() > QUEUE_BYTES {
+        if packet.len() > limit {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet exceeds queue limit",
+            )));
+        }
+        if peer.inbound.bytes > limit - packet.len() {
             peer.inbound.writer = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        peer.inbound.push(Bytes::copy_from_slice(packet));
+        if packet.len() > state.config.total_queue_bytes {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet exceeds router budget",
+            )));
+        }
+        if state.stats.queued_bytes > state.config.total_queue_bytes - packet.len() {
+            state.budget_waiters.insert(self.0.id, cx.waker().clone());
+            return Poll::Pending;
+        }
+        state.budget_waiters.remove(&self.0.id);
+        state
+            .peers
+            .get_mut(&self.0.id)
+            .unwrap()
+            .inbound
+            .push(Bytes::copy_from_slice(packet));
+        state.reserve(packet.len());
         if let Some(waker) = state.input_waker.take() {
             waker.wake();
         }
@@ -395,14 +479,27 @@ async fn run(mut device: PacketDevice, shared: Shared) -> io::Result<()> {
                         .find(|id| state.peers[id].config.incoming(dst, src))
                 });
                 if let Some(id) = selected {
-                    if !state
-                        .peers
-                        .get_mut(&id)
-                        .unwrap()
-                        .outbound
-                        .push(Bytes::copy_from_slice(&buffer[..length]))
-                    {
+                    let global_full = length
+                        > state
+                            .config
+                            .total_queue_bytes
+                            .saturating_sub(state.stats.queued_bytes);
+                    let peer_full = length
+                        > state
+                            .config
+                            .per_peer_queue_bytes
+                            .saturating_sub(state.peers[&id].outbound.bytes);
+                    if global_full || peer_full {
                         state.stats.full_queue_drops += 1;
+                        state.stats.global_budget_drops += u64::from(global_full);
+                    } else {
+                        state
+                            .peers
+                            .get_mut(&id)
+                            .unwrap()
+                            .outbound
+                            .push(Bytes::copy_from_slice(&buffer[..length]));
+                        state.reserve(length);
                     }
                 } else {
                     state.stats.unroutable_packets += 1;
@@ -428,6 +525,7 @@ async fn run(mut device: PacketDevice, shared: Shared) -> io::Result<()> {
                     let id = state.round_robin.pop_front().unwrap();
                     state.round_robin.push_back(id);
                     if let Some(packet) = state.peers.get_mut(&id).unwrap().inbound.pop() {
+                        state.release(packet.len());
                         return Poll::Ready(Ok((id, packet)));
                     }
                 }
@@ -459,4 +557,86 @@ async fn run(mut device: PacketDevice, shared: Shared) -> io::Result<()> {
         Ok::<(), io::Error>(())
     };
     tokio::select! { result = outbound => result, result = inbound => result }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Wake,
+    };
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn factory(shared: &Shared, name: &str, suffix: u8) -> Factory {
+        Factory {
+            shared: shared.clone(),
+            identity: PeerId::new(name).unwrap(),
+            config: vpn::Config {
+                local: vec!["198.18.0.10".parse().unwrap()],
+                peer: vec![format!("198.18.0.{suffix}").parse().unwrap()],
+                local_routes: vec![],
+                peer_routes: vec![],
+            },
+        }
+    }
+    fn packet(suffix: u8) -> Vec<u8> {
+        let mut p = vec![0; 1500];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&1500_u16.to_be_bytes());
+        p[12..16].copy_from_slice(&[198, 18, 0, suffix]);
+        p[16..20].copy_from_slice(&[198, 18, 0, 10]);
+        p
+    }
+    #[test]
+    fn shared_budget_wakes_other_peer_after_drop_and_replacement() {
+        let shared = Arc::new(Mutex::new(State {
+            config: RouterConfig {
+                per_peer_queue_bytes: 3000,
+                total_queue_bytes: 1500,
+            },
+            ..State::default()
+        }));
+        let first = factory(&shared, "first", 1);
+        let mut one = first.open().unwrap();
+        let mut two = factory(&shared, "second", 2).open().unwrap();
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            one.send.poll_send(&mut cx, &packet(1)),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(two.send.poll_send(&mut cx, &packet(2)).is_pending());
+        // Replacement must release old queued bytes even if old handles survive.
+        let mut replacement = first.open().unwrap();
+        assert!(
+            replacement
+                .recv
+                .poll_recv(&mut cx, &mut [0; 1500])
+                .is_pending()
+        );
+        assert!(count.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(shared.lock().unwrap().stats.queued_bytes, 0);
+        assert!(matches!(
+            two.send.poll_send(&mut cx, &packet(2)),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(replacement.send.poll_send(&mut cx, &packet(1)).is_pending());
+        count.0.store(0, Ordering::SeqCst);
+        drop(two);
+        assert!(count.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            replacement.send.poll_send(&mut cx, &packet(1)),
+            Poll::Ready(Ok(()))
+        ));
+        drop(one);
+        assert_eq!(shared.lock().unwrap().stats.queued_bytes, 1500);
+        drop(replacement);
+        assert_eq!(shared.lock().unwrap().stats.queued_bytes, 0);
+    }
 }

@@ -1,5 +1,8 @@
 # Server integration review — 2026-10-17
 
+Delivery update (2026-10-18): see [STATUS.md](STATUS.md). Findings below describe
+the review-start state; source publication and client provisioning have since advanced.
+
 Scope: Foldfin server, authorization/admission, shared packet router and its
 Floppa host. This is a source review, not a completed multi-user deployment audit.
 The existing Singapore transport acceptance used a temporary static credential;
@@ -141,7 +144,6 @@ setup belong to Floppa/deployment; adding those to the protocol would create a s
 source of truth. No Chromium stack, custom mux or second account database is required.
 
 Release remains gated on deploying the multi-user node through the isolated physical
-Singapore path, exercising the real TUN/firewall/NAT with its issued profiles, and
-publishing/pinning the protocol source for CI rather than relying on adjacent local
-checkouts. Client API-driven provisioning, full/split DNS lifecycle and Android runtime
-acceptance are separate from the completed server implementation.
+Singapore path, exercising the real TUN/firewall/NAT with production-issued profiles. Protocol publication and Git pinning are complete; client
+API-driven provisioning is implemented in Floppa PR #58. Full/split DNS lifecycle
+and Android runtime acceptance remain separate from the completed server implementation.

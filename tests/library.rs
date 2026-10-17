@@ -927,3 +927,184 @@ async fn h3_proxy_preserves_half_close_and_cancels_upstream_on_drop() {
 async fn h3_slow_readers_preserve_bidirectional_backpressure() {
     slow_reader_backpressure(true).await;
 }
+
+#[tokio::test]
+async fn session_stop_reports_failure_after_releasing_device() {
+    use foldfin::session::{Event, Session};
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (packet_device, tx, _rx) = device(drops.clone());
+    let (server_device, _tx, _rx) = device(Arc::new(AtomicUsize::new(0)));
+    let fixture = Fixture::new(Some(VpnConfig {
+        policy: config("198.18.0.2", "198.18.0.1"),
+        device: Arc::new(Factory(Mutex::new(Some(server_device)))),
+    }))
+    .await;
+    let mut session = Session::new(config("198.18.0.1", "198.18.0.2"), packet_device).unwrap();
+    let mut events = session.subscribe();
+    session.recover(fixture.client().await).await.unwrap();
+    // The packet adapter returns InvalidData; this must remain observable on stop.
+    tx.send(vec![0; 65537]).unwrap();
+    timeout(Duration::from_secs(3), async {
+        while !matches!(*events.borrow_and_update(), Event::CarrierLost { .. }) {
+            events.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(session.stop().await.is_err());
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    assert_eq!(session.snapshot(), Event::Closed);
+    session.stop().await.unwrap();
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn router_budget_bounds_slow_readers_and_preserves_small_buffer_packet() {
+    use foldfin::{
+        admission::PeerId,
+        router::{Router, RouterConfig},
+    };
+    use std::future::poll_fn;
+    let (device, inject, _rx) = device(Arc::new(AtomicUsize::new(0)));
+    let mut router = Router::start_with_config(
+        device,
+        RouterConfig {
+            per_peer_queue_bytes: 1500,
+            total_queue_bytes: 3000,
+        },
+    )
+    .unwrap();
+    let mut peers = Vec::new();
+    for suffix in 1..=3 {
+        let factory = router
+            .peer(
+                PeerId::new(format!("peer-{suffix}")).unwrap(),
+                config("198.18.0.10", &format!("198.18.0.{suffix}")),
+            )
+            .unwrap();
+        let mut peer = factory.open().unwrap();
+        let mut buffer = [0; 1500];
+        assert!(
+            peer.recv
+                .poll_recv(
+                    &mut Context::from_waker(std::task::Waker::noop()),
+                    &mut buffer
+                )
+                .is_pending()
+        );
+        peers.push(peer);
+    }
+    let make_reply = |suffix| {
+        let mut p = packet([198, 18, 0, 10], [198, 18, 0, suffix]);
+        p.resize(1500, 0);
+        p[2..4].copy_from_slice(&1500_u16.to_be_bytes());
+        p
+    };
+    // Two slow peers consume the shared budget; the third drops independently.
+    for suffix in 1..=3 {
+        inject.send(make_reply(suffix)).unwrap();
+    }
+    timeout(Duration::from_secs(2), async {
+        while router.stats().global_budget_drops == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(router.stats().queued_bytes, 3000);
+    let err = poll_fn(|cx| peers[0].recv.poll_recv(cx, &mut [0; 1]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(router.stats().queued_bytes, 3000);
+    let mut buffer = [0; 1500];
+    assert_eq!(
+        poll_fn(|cx| peers[0].recv.poll_recv(cx, &mut buffer))
+            .await
+            .unwrap(),
+        1500
+    );
+    assert_eq!(buffer.as_slice(), make_reply(1));
+    inject.send(make_reply(3)).unwrap();
+    timeout(
+        Duration::from_secs(2),
+        poll_fn(|cx| peers[2].recv.poll_recv(cx, &mut buffer)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(buffer.as_slice(), make_reply(3));
+    assert_eq!(router.stats().peak_queued_bytes, 3000);
+    // Stop frees queued packets even while callers retain peer endpoints.
+    router.stop().await.unwrap();
+    assert_eq!(router.stats().queued_bytes, 0);
+}
+
+#[tokio::test]
+async fn router_slow_peers_do_not_stall_fast_peers_under_bursts() {
+    use foldfin::{
+        admission::PeerId,
+        router::{Router, RouterConfig},
+    };
+    use std::future::poll_fn;
+    let (device, inject, _rx) = device(Arc::new(AtomicUsize::new(0)));
+    let mut router = Router::start_with_config(
+        device,
+        RouterConfig {
+            per_peer_queue_bytes: 1500,
+            total_queue_bytes: 65536,
+        },
+    )
+    .unwrap();
+    let mut peers = Vec::new();
+    for suffix in 1..=32 {
+        let mut peer = router
+            .peer(
+                PeerId::new(format!("burst-{suffix}")).unwrap(),
+                config("198.18.0.100", &format!("198.18.0.{suffix}")),
+            )
+            .unwrap()
+            .open()
+            .unwrap();
+        assert!(
+            peer.recv
+                .poll_recv(
+                    &mut Context::from_waker(std::task::Waker::noop()),
+                    &mut [0; 1500]
+                )
+                .is_pending()
+        );
+        peers.push(peer);
+    }
+    timeout(Duration::from_secs(5), async {
+        for round in 0..128_u8 {
+            for suffix in 1..=32 {
+                let mut reply = packet([198, 18, 0, 100], [198, 18, 0, suffix]);
+                reply.resize(1500, round);
+                reply[2..4].copy_from_slice(&1500_u16.to_be_bytes());
+                inject.send(reply).unwrap();
+            }
+            // The first sixteen clients never read; all fast clients still progress.
+            for peer in &mut peers[16..] {
+                let mut buffer = [0; 1500];
+                assert_eq!(
+                    poll_fn(|cx| peer.recv.poll_recv(cx, &mut buffer))
+                        .await
+                        .unwrap(),
+                    1500
+                );
+                assert_eq!(buffer[1499], round);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let stats = router.stats();
+    assert_eq!(stats.queued_bytes, 16 * 1500);
+    assert_eq!(stats.full_queue_drops, 16 * 127);
+    assert_eq!(stats.global_budget_drops, 0);
+    assert!(stats.peak_queued_bytes <= 32 * 1500);
+    drop(peers);
+    assert_eq!(router.stats().queued_bytes, 0);
+    router.stop().await.unwrap();
+}

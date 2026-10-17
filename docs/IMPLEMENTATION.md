@@ -5,16 +5,19 @@ CONNECT-UDP and CONNECT-IP. Remove Chrome/BoringSSL. Session and packet-device
 ownership outlive carriers. Floppa owns recovery policy and platform networking;
 Android owns its system lockdown policy. No protocol-owned kill switch.
 
+Current delivery state: [STATUS.md](STATUS.md). The increments below are historical.
+
 ## Delivery sequence
 
 - [x] Record original source (364a0c5) and release binary baseline.
 - [x] Fix packet collector fairness and capsule request/response bounds.
 - [x] H3 vertical slice with caller-owned UDP sockets and TLS validation.
-- [ ] Transport-independent sessions, bounded queues, recovery and multi-peer router.
+- [x] Transport-independent sessions, bounded queues, recovery and multi-peer router.
 - [x] Remove Chrome backend; update CLI and regression harnesses.
-- [ ] Floppa config v2, dual-stack NetworkPlan, Underlay, Recovering and typed health.
-- [ ] Floppa node binary, provisioning, versioned grant synchronization and metrics.
-- [ ] Local dual-stack, loss/latency, multi-peer and lifecycle acceptance.
+- [x] Floppa config v2, dual-stack NetworkPlan, Underlay, Recovering and typed health.
+- [x] Floppa node binary, provisioning, versioned grant synchronization and metrics.
+- [x] Local dual-stack, multi-peer and lifecycle acceptance.
+- [ ] Full load and latency/loss matrix; adversarial resource-exhaustion acceptance.
 - [ ] Physical Android and isolated Singapore API/database/node acceptance.
 
 ## Invariants

@@ -19,10 +19,11 @@ reports describe older versions; their commands and conclusions are not current
 feature documentation. CONNECT-UDP proxying is not implemented. UDP inside the IP
 VPN is supported.
 
-The Floppa branch already integrates configuration import, protected/marked outer
-sockets and actor recovery. Full account-to-node provisioning and multi-user
-production deployment remain incomplete. See [server review](docs/SERVER-REVIEW.md)
-and [implementation status](docs/IMPLEMENTATION.md) for the remaining work.
+Floppa implements the API/database/node path, protected/marked outer sockets and
+actor recovery. Automatic client provisioning and initial admin-plan access are
+implemented in Floppa PR #58; production rollout and end-to-end acceptance remain
+pending. See [current status](docs/STATUS.md) for implementation versus deployment
+and [server review](docs/SERVER-REVIEW.md) for the historical findings.
 
 ## Ownership
 
@@ -67,6 +68,7 @@ three Cargo patches; dependency-level patch tables are ignored by Cargo.
 
 - [Library API and lifecycle](docs/LIBRARY.md)
 - [Architecture](docs/ARCHITECTURE.md) and [product goals](docs/GOALS.md)
+- [Current implementation and release gates](docs/STATUS.md)
 - [Implementation history and open gates](docs/IMPLEMENTATION.md)
 - [Server review and completion architecture](docs/SERVER-REVIEW.md)
 - [Validation history](docs/VALIDATION.md)

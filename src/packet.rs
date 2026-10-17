@@ -17,6 +17,10 @@ pub trait PacketRecv: Send + 'static {
 }
 
 /// Writes one complete packet. Partial writes are errors, never another packet.
+/// Polls must return promptly without blocking or re-entering the owning session
+/// or router: these may serialize polling with generation changes under a lock.
+/// Pending must not consume the packet; cancellation may discard it. Register
+/// the supplied waker when Pending so the owner can resume on readiness.
 pub trait PacketSend: Send + 'static {
     fn poll_send(&mut self, cx: &mut Context<'_>, packet: &[u8]) -> Poll<io::Result<()>>;
 }

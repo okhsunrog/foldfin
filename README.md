@@ -77,3 +77,9 @@ physical interface in an isolated namespace, with outer route, source and packet
 capture evidence. There is no automatic fallback through an existing VPN.
 H2/H3 actor recovery passed that path, but full internet tunnel, OS DNS lifecycle,
 physical IPv6 WAN, physical Android and API/database/node acceptance remain open.
+
+## License
+
+Licensed under either the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option.
+Vendored dependencies retain their own licenses; see [vendor/README.md](vendor/README.md).

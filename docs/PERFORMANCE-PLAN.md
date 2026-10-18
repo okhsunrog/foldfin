@@ -115,3 +115,11 @@ lifecycle, setup/rollback and carrier-loss behavior. Separate server buffer poli
 and upload stability diagnosis require their own evidence; more H2 window tuning
 is not justified by this run. Remote IPv6, Android and censorship-resistance
 acceptance remain unestablished.
+
+## 2026-10-18: packet versus stream tunneling
+
+A controlled mixed-load comparison of current H2 CONNECT-IP and TCP CONNECT is
+recorded in [TCP-SPLIT-COMPARISON-2026-10-18.md](TCP-SPLIT-COMPARISON-2026-10-18.md).
+It includes loss, latency, short requests, four concurrent flows and outer packet
+metadata. No general speed/latency advantage of TCP split was established; the
+upstream payload profile differs substantially. Production architecture is unchanged.

@@ -83,6 +83,15 @@ def server(address):
             sock.settimeout(60)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             request = read_json(sock)
+            if request.get('direction') == 'probe':
+                sock.sendall(b'P' * 1024)
+                return
+            if request.get('direction') == 'timed-download':
+                sock.sendall(b'R')
+                try:
+                    while True: sock.sendall(FRAME)
+                except OSError:
+                    return  # bounded receiver finished; no trailer/drain is needed
             assert 3 <= request['seconds'] <= 60 and request['omit'] == 2
             sock.sendall(b'R')
             if request['direction'] == 'upload':
@@ -119,7 +128,7 @@ def client(address, direction, seconds, socks):
         else:
             sock.shutdown(socket.SHUT_WR)
             result = receive(sock, 2)
-        print(json.dumps(result), flush=True)
+        return result
 
 
 if __name__ == '__main__':
@@ -131,4 +140,4 @@ if __name__ == '__main__':
     parser.add_argument('--socks', type=int)
     args = parser.parse_args()
     if args.server: server(args.address)
-    else: client(args.address, args.direction, args.seconds, args.socks)
+    else: print(json.dumps(client(args.address, args.direction, args.seconds, args.socks)), flush=True)

@@ -766,5 +766,10 @@ pub(crate) async fn bridge_h3(
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
-    tokio::select! { result = control => result, result = upload => result, result = download => result }
+    tokio::select! {
+        result = sender.watch_vpn_mtu() => result.map_err(anyhow::Error::from),
+        result = control => result,
+        result = upload => result,
+        result = download => result,
+    }
 }

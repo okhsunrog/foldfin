@@ -173,8 +173,29 @@ impl Sender {
             }
         }
     }
+    /// Monitor even idle/receive-only sessions: small outgoing packets alone
+    /// cannot establish that the path still supports the IPv6 minimum.
+    #[cfg(any(feature = "client", feature = "server"))]
+    pub(crate) async fn watch_vpn_mtu(&self) -> Result<()> {
+        watch_vpn_mtu(|| self.datagrams.require_mtu(self.id, 1280)).await
+    }
     pub fn send(&self, packet: Bytes) -> Result<()> {
+        // Do not allow small packets to keep an undersized VPN path alive until
+        // the periodic check. The transport also checks the actual packet size.
+        self.datagrams.require_mtu(self.id, 1280)?;
         self.datagrams.send(self.id, packet)
+    }
+}
+
+#[cfg(any(feature = "client", feature = "server", test))]
+async fn watch_vpn_mtu(check: impl Fn() -> Result<()>) -> Result<()> {
+    // Quinn exposes current datagram capacity but no capacity-change notification.
+    // This borrowed future lives inside the bridge; it owns no detached task.
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        check()?;
     }
 }
 pub struct Receiver {
@@ -251,5 +272,54 @@ mod tests {
         drop(receiver);
         assert_eq!(budget.available_permits(), QUEUE_BYTES);
         assert!(shared.routes.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mtu_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn capacity_loss_ends_idle_session_without_waiting_for_large_packet() {
+        let capacity = Arc::new(AtomicUsize::new(1280));
+        let checked = Arc::new(tokio::sync::Notify::new());
+        let monitor = tokio::spawn({
+            let capacity = capacity.clone();
+            let checked = checked.clone();
+            async move {
+                watch_vpn_mtu(|| {
+                    let available = capacity.load(Ordering::SeqCst);
+                    checked.notify_one();
+                    if available < 1280 {
+                        Err(Error::PathMtu {
+                            required: 1280,
+                            available,
+                        })
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await
+            }
+        });
+        checked.notified().await;
+        assert!(!monitor.is_finished());
+        // The new path could still carry ACK-sized datagrams. No packet is sent:
+        // the same monitor must fail for idle and receive-only sessions too.
+        capacity.store(1200, Ordering::SeqCst);
+        let error = tokio::time::timeout(Duration::from_secs(2), monitor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::PathMtu {
+                required: 1280,
+                available: 1200
+            }
+        ));
+        assert!(error.permits_transport_fallback());
     }
 }

@@ -57,3 +57,26 @@ passed with the default features and with H3. Proxy smoke tests and routed local
 namespace acceptance passed for H2 and H3, including dual-stack TCP/UDP/ICMP,
 reverse traffic, loss/delay and cleanup. These checks do not establish multi-user
 WAN capacity or complete the Floppa production/Android gates above.
+
+H3 PMTU follow-up: CONNECT-IP checks the 1280-byte minimum before each outgoing
+packet and monitors Quinn's reported datagram capacity every 250 ms, including
+idle/receive-only sessions. A detected reduction below that minimum terminates
+the request; no detached monitor task or platform MTU change is introduced.
+`PathMtu` remains typed when the client joins the failed tunnel. The session emits
+CarrierLost while retaining its packet device. The monitor observes Quinn's path
+estimate; it does not independently discover physical MTU changes or replace QUIC
+black-hole detection. Tests simulate a capacity reduction after a valid initial
+check and verify preservation of error classification. Physical roaming/PMTU
+acceptance remains pending.
+
+Floppa's existing actor handles CarrierLost through retained-device recovery.
+A fresh H3 attempt that fails the minimum-capacity check permits H2 fallback in
+Auto mode; H3Only remains H3-only. Its configured TUN MTU stays 1280. This code-path
+review does not claim a new physical Floppa acceptance run or update its Git pin.
+
+PMTU validation: default and H3 all-target check/Clippy and tests passed; the H3
+suite has 44 tests including doctests. H3 proxy smoke and routed dual-stack local
+namespace acceptance passed. The additional H3-without-client/server library
+Clippy check passes; its all-target variant reports unused `Config::incoming`
+and `allowed_ip` in unchanged test-only code. PMTU reduction itself is simulated
+in the monitor regression, not injected into a physical WAN path.

@@ -158,7 +158,7 @@ impl PreparedVpn {
                 Some(status.clone()),
             )
             .await
-            .map_err(Error::from);
+            .map_err(bridge_error);
             status.send_replace(match &result {
                 Ok(()) => SessionState::Closed,
                 Err(error) => SessionState::Failed {
@@ -173,5 +173,37 @@ impl PreparedVpn {
             state,
             counters,
         }
+    }
+}
+
+// Preserve transport capability errors across the bridge's anyhow parser/IO
+// boundary so callers can classify failures without parsing their descriptions.
+fn bridge_error(error: anyhow::Error) -> Error {
+    error.downcast::<Error>().unwrap_or_else(Error::Protocol)
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    #[test]
+    fn bridge_preserves_path_mtu_and_does_not_reclassify_protocol_errors() {
+        let error = bridge_error(
+            anyhow::Error::new(Error::PathMtu {
+                required: 1280,
+                available: 1200,
+            })
+            .context("CONNECT-IP bridge"),
+        );
+        assert!(matches!(
+            error,
+            Error::PathMtu {
+                required: 1280,
+                available: 1200
+            }
+        ));
+        assert!(error.permits_transport_fallback());
+        let error = bridge_error(anyhow::anyhow!("invalid control capsule"));
+        assert!(matches!(error, Error::Protocol(_)));
+        assert!(!error.permits_transport_fallback());
     }
 }
